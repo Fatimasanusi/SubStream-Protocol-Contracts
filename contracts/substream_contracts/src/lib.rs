@@ -54,6 +54,8 @@ pub enum DataKey {
     CreatorSplit(Address),
     ContractAdmin,
     VerifiedCreator(Address),
+    BlacklistedUser(Address, Address), // (creator, user_to_block)
+    CreatorAudience(Address, Address), // (creator, beneficiary)
 }
 
 #[contracttype]
@@ -84,6 +86,21 @@ pub struct Subscription {
 pub struct SplitPartition {
     pub partner: Address,
     pub percentage: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatorStats {
+    pub total_earned: i128,
+    pub lifetime_fans: u64,
+    pub active_fans: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatorAudience {
+    pub active_streams: u32,
+    pub has_supported: bool,
 }
 
 // --- Events ---
@@ -238,6 +255,51 @@ impl SubStreamContract {
     pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
         cancel_internal(&env, &subscriber, &channel_id);
     }
+
+    // --- Blacklist functionality for Issue #25 ---
+    
+    pub fn blacklist_user(env: Env, creator: Address, user_to_block: Address) {
+        creator.require_auth();
+        
+        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_block.clone());
+        
+        // Check if already blacklisted
+        if env.storage().persistent().has(&blacklist_key) {
+            panic!("user already blacklisted");
+        }
+        
+        // Add to blacklist
+        env.storage().persistent().set(&blacklist_key, &true);
+        
+        // Emit event
+        UserBlacklisted { creator, user: user_to_block }.publish(&env);
+    }
+    
+    pub fn unblacklist_user(env: Env, creator: Address, user_to_unblock: Address) {
+        creator.require_auth();
+        
+        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_unblock.clone());
+        
+        // Check if user is actually blacklisted
+        if !env.storage().persistent().has(&blacklist_key) {
+            panic!("user not blacklisted");
+        }
+        
+        // Remove from blacklist
+        env.storage().persistent().remove(&blacklist_key);
+        
+        // Emit event
+        UserUnblacklisted { creator, user: user_to_unblock }.publish(&env);
+    }
+    
+    pub fn is_user_blacklisted(env: Env, creator: Address, user: Address) -> bool {
+        let blacklist_key = DataKey::BlacklistedUser(creator, user);
+        env.storage().persistent().get(&blacklist_key).unwrap_or(false)
+    }
+
+    pub fn creator_stats(env: Env, creator: Address) -> CreatorStats {
+        get_creator_stats(&env, &creator)
+    }
 }
 
 // --- Internal Logic & Helpers ---
@@ -263,6 +325,84 @@ fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         env.storage().temporary().set(key, sub);
         env.storage().persistent().remove(key);
     }
+}
+
+fn default_creator_stats() -> CreatorStats {
+    CreatorStats {
+        total_earned: 0,
+        lifetime_fans: 0,
+        active_fans: 0,
+    }
+}
+
+fn get_creator_stats(env: &Env, creator: &Address) -> CreatorStats {
+    env.storage()
+        .persistent()
+        .get(&DataKey::CreatorMetadata(creator.clone()))
+        .unwrap_or(default_creator_stats())
+}
+
+fn set_creator_stats(env: &Env, creator: &Address, stats: &CreatorStats) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::CreatorMetadata(creator.clone()), stats);
+}
+
+fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+    let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
+    let mut relationship: CreatorAudience = env
+        .storage()
+        .persistent()
+        .get(&relationship_key)
+        .unwrap_or(CreatorAudience {
+            active_streams: 0,
+            has_supported: false,
+        });
+    let mut stats = get_creator_stats(env, creator);
+
+    if !relationship.has_supported {
+        relationship.has_supported = true;
+        stats.lifetime_fans = stats.lifetime_fans.saturating_add(1);
+    }
+
+    if relationship.active_streams == 0 {
+        stats.active_fans = stats.active_fans.saturating_add(1);
+    }
+
+    relationship.active_streams = relationship.active_streams.saturating_add(1);
+    env.storage().persistent().set(&relationship_key, &relationship);
+    set_creator_stats(env, creator, &stats);
+}
+
+fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+    let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
+    let Some(mut relationship): Option<CreatorAudience> = env.storage().persistent().get(&relationship_key) else {
+        return;
+    };
+
+    if relationship.active_streams == 0 {
+        return;
+    }
+
+    relationship.active_streams -= 1;
+
+    let mut stats = get_creator_stats(env, creator);
+    if relationship.active_streams == 0 {
+        stats.active_fans = stats.active_fans.saturating_sub(1);
+    }
+
+    env.storage().persistent().set(&relationship_key, &relationship);
+    set_creator_stats(env, creator, &stats);
+}
+
+fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+
+    let mut stats = get_creator_stats(env, creator);
+    stats.total_earned = stats.total_earned.saturating_add(amount);
+    set_creator_stats(env, creator, &stats);
 }
 
 fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address, total_streamed_creator: Option<&Address>) -> i128 {
@@ -322,6 +462,7 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
             let payout = if i + 1 == creators_len { remaining } else { (amount_to_payout * share) / 100 };
             remaining -= payout;
             if payout > 0 {
+                credit_creator_earnings(env, &creator, payout);
                 token_client.transfer(&env.current_contract_address(), &creator, &payout);
             }
         }
@@ -361,6 +502,10 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         let token_client = TokenClient::new(env, &sub.token);
         token_client.transfer(&env.current_contract_address(), &sub.payer, &sub.balance);
     }
+    for i in 0..sub.creators.len() {
+        let creator = sub.creators.get(i).unwrap();
+        unregister_creator_support(env, &creator, beneficiary);
+    }
     env.storage().persistent().remove(&key);
     env.storage().temporary().remove(&key);
 }
@@ -374,6 +519,7 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     token_client.transfer(payer, &env.current_contract_address(), &amount);
 
     let now = env.ledger().timestamp();
+    let creators_for_stats = creators.clone();
     let sub = Subscription {
         token: token.clone(),
         tier: Tier { rate_per_second: rate, trial_duration: FREE_TRIAL_DURATION },
@@ -388,6 +534,10 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
         beneficiary: beneficiary.clone(),
     };
     set_subscription(env, &key, &sub);
+    for i in 0..creators_for_stats.len() {
+        let creator = creators_for_stats.get(i).unwrap();
+        register_creator_support(env, &creator, beneficiary);
+    }
     Subscribed { subscriber: beneficiary.clone(), creator: stream_id.clone(), rate_per_second: rate }.publish(env);
 }
 
