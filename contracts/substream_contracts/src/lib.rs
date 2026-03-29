@@ -1,4 +1,6 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, Vec};
 
@@ -235,7 +237,7 @@ impl SubStreamContract {
         TipReceived { user, creator, token, amount }.publish(&env);
     }
 
-    pub fn subscribe_group(env: Env, payer: Address, channel_id: Address, token: Address, amount: i128, rate_per_second: i128, creators: Vec<Address>, percentages: Vec<u32>) {
+    pub fn subscribe_group(env: Env, payer: Address, channel_id: Address, token: Address, amount: i128, rate_per_second: i128, creators: soroban_sdk::Vec<Address>, percentages: soroban_sdk::Vec<u32>) {
         // Validate exactly 5 creators
         if creators.len() != 5 {
             panic!("group channel must contain exactly 5 creators");
@@ -420,7 +422,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
-fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: &Address, token: &Address, amount: i128, rate: i128, creators: Vec<Address>, percentages: Vec<u32>) {
+fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: &Address, token: &Address, amount: i128, rate: i128, creators: soroban_sdk::Vec<Address>, percentages: soroban_sdk::Vec<u32>) {
     payer.require_auth();
     let key = subscription_key(beneficiary, stream_id);
     if subscription_exists(env, &key) { panic!("exists"); }
@@ -463,3 +465,4 @@ mod test;
 #[cfg(test)]
 mod test_withdrawal_consistency;
 #[cfg(test)]
+mod test_tiny_streams;
