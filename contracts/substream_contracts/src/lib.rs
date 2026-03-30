@@ -56,6 +56,9 @@ pub enum DataKey {
     VerifiedCreator(Address),
     BlacklistedUser(Address, Address), // (creator, user_to_block)
     CreatorAudience(Address, Address), // (creator, beneficiary)
+    MinimumRate(Address),              // Minimum rate floor for PWYW
+    CommunityGoal(Address),            // Target flow rate for "Bonus Video"
+    CurrentFlowRate(Address),          // Aggregated flow rate for a channel
 }
 
 #[contracttype]
@@ -74,6 +77,7 @@ pub struct Subscription {
     pub last_collected: u64,
     pub start_time: u64,
     pub last_funds_exhausted: u64,
+    pub free_to_paid_emitted: bool,
     pub creators: soroban_sdk::Vec<Address>,
     pub percentages: soroban_sdk::Vec<u32>,
     pub payer: Address,
@@ -300,6 +304,27 @@ impl SubStreamContract {
     pub fn creator_stats(env: Env, creator: Address) -> CreatorStats {
         get_creator_stats(&env, &creator)
     }
+
+    pub fn set_minimum_rate(env: Env, creator: Address, min_rate: i128) {
+        creator.require_auth();
+        env.storage().persistent().set(&DataKey::MinimumRate(creator), &min_rate);
+    }
+
+    pub fn set_community_goal(env: Env, creator: Address, goal_tokens_per_day: i128) {
+        creator.require_auth();
+        // Convert tokens/day to flow rate (units per second)
+        // Using PRECISION_MULTIPLIER to maintain high-fidelity streaming math
+        let goal_per_sec = (goal_tokens_per_day * PRECISION_MULTIPLIER) / 86400;
+        env.storage().persistent().set(&DataKey::CommunityGoal(creator), &goal_per_sec);
+    }
+
+    pub fn is_community_goal_met(env: Env, creator: Address) -> bool {
+        let goal: i128 = env.storage().persistent().get(&DataKey::CommunityGoal(creator.clone())).unwrap_or(0);
+        if goal == 0 { return false; }
+        
+        let current: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(creator)).unwrap_or(0);
+        current >= goal
+    }
 }
 
 // --- Internal Logic & Helpers ---
@@ -496,10 +521,15 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("too early"); }
+    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
 
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect
+
+    let rate = sub.tier.rate_per_second;
+    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    total_flow = total_flow.saturating_sub(rate);
+    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     if sub.balance > 0 {
         let token_client = TokenClient::new(env, &sub.token);
@@ -521,8 +551,14 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     let key = subscription_key(beneficiary, stream_id);
     if subscription_exists(env, &key) { panic!("exists"); }
 
-    let token_client = TokenClient::new(env, token);
-    token_client.transfer(payer, &env.current_contract_address(), &amount);
+    let floor: i128 = env.storage().persistent().get(&DataKey::MinimumRate(stream_id.clone())).unwrap_or(0);
+    if rate < floor { panic!("rate below floor"); }
+
+    // Trial support: Allow starting a stream with 0 initial balance
+    if amount > 0 {
+        let token_client = TokenClient::new(env, token);
+        token_client.transfer(payer, &env.current_contract_address(), &amount);
+    }
 
     let now = env.ledger().timestamp();
     let creators_for_stats = creators.clone();
@@ -541,6 +577,11 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
         accrued_remainder: 0,
     };
     set_subscription(env, &key, &sub);
+
+    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    total_flow = total_flow.saturating_add(rate);
+    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+
     for i in 0..creators_for_stats.len() {
         let creator = creators_for_stats.get(i).unwrap();
         register_creator_support(env, &creator, beneficiary);
