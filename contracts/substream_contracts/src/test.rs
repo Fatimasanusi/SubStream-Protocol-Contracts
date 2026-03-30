@@ -958,6 +958,7 @@ fn test_creator_stats_track_direct_stream_lifecycle() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // rate 3 tokens/s = 3 * PRECISION_MULTIPLIER; 10 s post-trial → 30 tokens earned
     env.ledger().set_timestamp(100);
     // rate = 3 tokens/second = 3 × PRECISION_MULTIPLIER nano-units/second.
     client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000);
