@@ -2,7 +2,7 @@
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -79,6 +79,7 @@ pub struct Subscription {
     pub payer: Address,
     pub beneficiary: Address,
     pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+    pub free_to_paid_emitted: bool,
 }
 
 #[contracttype]
@@ -110,6 +111,18 @@ pub struct TierChanged {
     #[topic] pub creator: Address,
     pub old_rate: i128,
     pub new_rate: i128,
+}
+
+#[contractevent]
+pub struct UserBlacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct UserUnblacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
 }
 
 #[contractevent]
@@ -162,7 +175,7 @@ impl SubStreamContract {
     pub fn verify_creator(env: Env, admin: Address, creator: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("admin only"); }
+        if admin != stored_admin { panic!("only admin can verify creators"); }
 
         env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
         CreatorVerified { creator, verified_by: admin }.publish(&env);
@@ -299,6 +312,32 @@ impl SubStreamContract {
 
     pub fn creator_stats(env: Env, creator: Address) -> CreatorStats {
         get_creator_stats(&env, &creator)
+    }
+
+    /// Upgrade or downgrade a subscription tier mid-period.
+    ///
+    /// All charges accrued at the old rate are settled first (pro-rated to the
+    /// second), then the rate is replaced atomically.  The invariant tested by
+    /// the fuzz suite is:
+    ///   total_paid == time_on_old_tier * old_rate + time_on_new_tier * new_rate
+    pub fn change_tier(env: Env, subscriber: Address, creator: Address, new_rate: i128) {
+        if new_rate <= 0 { panic!("invalid rate"); }
+        let key = subscription_key(&subscriber, &creator);
+        if !subscription_exists(&env, &key) { panic!("no subscription"); }
+
+        let sub = get_subscription(&env, &key);
+        sub.payer.require_auth();
+        let old_rate = sub.tier.rate_per_second;
+
+        // Settle all pending charges at the old rate before switching tiers.
+        distribute_and_collect(&env, &subscriber, &creator, Some(&creator));
+
+        // Re-fetch after collect so we have the freshest last_collected timestamp.
+        let mut sub = get_subscription(&env, &key);
+        sub.tier.rate_per_second = new_rate;
+        set_subscription(&env, &key, &sub);
+
+        TierChanged { subscriber, creator, old_rate, new_rate }.publish(&env);
     }
 }
 
@@ -496,7 +535,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("too early"); }
+    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel: minimum duration not met"); }
 
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect
@@ -558,3 +597,5 @@ mod test;
 mod test_withdrawal_consistency;
 #[cfg(test)]
 mod test_tiny_streams;
+#[cfg(test)]
+mod test_multi_tier_upgrade;
