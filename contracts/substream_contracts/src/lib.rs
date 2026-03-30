@@ -73,8 +73,9 @@ pub enum DataKey {
     NFTAwarded(Address, Address), // (beneficiary, stream_id) - For #44
     BlacklistedUser(Address, Address), // (creator, user_to_block)
     CreatorAudience(Address, Address), // (creator, beneficiary)
-    ReferralTracker(Address, Address), // (referrer, referred_user)
-    UserReferrer(Address),             // (referred_user -> referrer)
+    MinimumRate(Address),              // Minimum rate floor for PWYW
+    CommunityGoal(Address),            // Target flow rate for "Bonus Video"
+    CurrentFlowRate(Address),          // Aggregated flow rate for a channel
 }
 
 #[contracttype]
@@ -546,51 +547,25 @@ impl SubStreamContract {
         get_creator_stats(&env, &creator)
     }
 
-    // --- Referral functionality ---
-
-    pub fn register_referral(env: Env, referrer: Address, referred_user: Address) {
-        referrer.require_auth();
-
-        // Check if referred user already has a referrer
-        let user_referrer_key = DataKey::UserReferrer(referred_user.clone());
-        if env.storage().persistent().has(&user_referrer_key) {
-            panic!("user already has a referrer");
-        }
-
-        // Check if referrer is trying to refer themselves
-        if referrer == referred_user {
-            panic!("cannot refer yourself");
-        }
-
-        // Set the referral relationship
-        env.storage()
-            .persistent()
-            .set(&user_referrer_key, &referrer);
-
-        // Update referrer's tracking info
-        let referral_tracker_key =
-            DataKey::ReferralTracker(referrer.clone(), referred_user.clone());
-        env.storage().persistent().set(&referral_tracker_key, &true);
-
-        // Get and update referrer's referral info
-        let mut referral_info = get_referral_info(&env, &referrer);
-        referral_info.referral_count += 1;
-        set_referral_info(&env, &referrer, &referral_info);
-
-        // Emit event
-        ReferralRegistered {
-            referrer,
-            referred_user,
-        }
-        .publish(&env);
+    pub fn set_minimum_rate(env: Env, creator: Address, min_rate: i128) {
+        creator.require_auth();
+        env.storage().persistent().set(&DataKey::MinimumRate(creator), &min_rate);
     }
 
-    pub fn get_user_referrer(env: Env, user: Address) -> Option<Address> {
-        env.storage().persistent().get(&DataKey::UserReferrer(user))
+    pub fn set_community_goal(env: Env, creator: Address, goal_tokens_per_day: i128) {
+        creator.require_auth();
+        // Convert tokens/day to flow rate (units per second)
+        // Using PRECISION_MULTIPLIER to maintain high-fidelity streaming math
+        let goal_per_sec = (goal_tokens_per_day * PRECISION_MULTIPLIER) / 86400;
+        env.storage().persistent().set(&DataKey::CommunityGoal(creator), &goal_per_sec);
     }
 
-    pub fn get_referral_info(env: Env, referrer: Address) -> ReferralInfo {
-        get_referral_info(&env, &referrer)
+    pub fn is_community_goal_met(env: Env, creator: Address) -> bool {
+        let goal: i128 = env.storage().persistent().get(&DataKey::CommunityGoal(creator.clone())).unwrap_or(0);
+        if goal == 0 { return false; }
+        
+        let current: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(creator)).unwrap_or(0);
+        current >= goal
     }
 }
 
@@ -860,8 +835,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    let now = env.ledger().timestamp();
-    let is_early = now < sub.start_time + MINIMUM_FLOW_DURATION;
+    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
 
     // Collect any charges that have accrued so far (zero during the trial window).
     distribute_and_collect(env, beneficiary, stream_id, None);
@@ -902,22 +876,11 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
             }
         }
 
-        // Deduct penalty from balance so the refund block below uses the
-        // correct remaining amount.
-        sub.balance = sub.balance.saturating_sub(penalty_nano);
+    let rate = sub.tier.rate_per_second;
+    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    total_flow = total_flow.saturating_sub(rate);
+    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
-        let refund_amount = sub.balance.max(0) / PRECISION_MULTIPLIER;
-        env.events().publish(
-            (
-                Symbol::new(env, "early_cancel"),
-                beneficiary.clone(),
-                stream_id.clone(),
-            ),
-            (penalty_tokens, refund_amount),
-        );
-    }
-
-    // Refund any remaining balance to the payer.
     if sub.balance > 0 {
         let token_client = TokenClient::new(env, &sub.token);
         let refund_amount = sub.balance / PRECISION_MULTIPLIER;
@@ -951,8 +914,14 @@ fn subscribe_core(
         panic!("exists");
     }
 
-    let token_client = TokenClient::new(env, token);
-    token_client.transfer(payer, &env.current_contract_address(), &amount);
+    let floor: i128 = env.storage().persistent().get(&DataKey::MinimumRate(stream_id.clone())).unwrap_or(0);
+    if rate < floor { panic!("rate below floor"); }
+
+    // Trial support: Allow starting a stream with 0 initial balance
+    if amount > 0 {
+        let token_client = TokenClient::new(env, token);
+        token_client.transfer(payer, &env.current_contract_address(), &amount);
+    }
 
     let now = env.ledger().timestamp();
     let creators_for_stats = creators.clone();
@@ -974,6 +943,11 @@ fn subscribe_core(
         accrued_remainder: 0,
     };
     set_subscription(env, &key, &sub);
+
+    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    total_flow = total_flow.saturating_add(rate);
+    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+
     for i in 0..creators_for_stats.len() {
         let creator = creators_for_stats.get(i).unwrap();
         register_creator_support(env, &creator, beneficiary);
