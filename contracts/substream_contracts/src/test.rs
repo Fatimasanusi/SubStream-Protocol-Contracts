@@ -2,6 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
+    testutils::{Address as _, Ledger},
     testutils::Events as _,
     testutils::{Address as _, Ledger},
     token, vec, Address, Env,
@@ -41,14 +42,7 @@ fn test_is_subscribed_active() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(
-        &subscriber,
-        &creator,
-        &token.address,
-        &1000,
-        &1_000_000_000,
-        &None,
-    );
+    client.subscribe(&subscriber, &creator, &token.address, &1000, &1_000_000_000);
 
     env.ledger().set_timestamp(105);
     assert!(client.is_subscribed(&subscriber, &creator));
@@ -169,14 +163,7 @@ fn test_free_trial_ignores_claims_within_first_week() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(
-        &subscriber,
-        &creator,
-        &token.address,
-        &300,
-        &3_000_000_000,
-        &None,
-    );
+    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000);
 
     env.ledger().set_timestamp(start + WEEK - 1);
     client.collect(&subscriber, &creator);
@@ -1383,14 +1370,7 @@ fn test_early_cancel_group_distributes_penalty() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
-    let creators = vec![
-        &env,
-        c1.clone(),
-        c2.clone(),
-        c3.clone(),
-        c4.clone(),
-        c5.clone(),
-    ];
+    let creators = vec![&env, c1.clone(), c2.clone(), c3.clone(), c4.clone(), c5.clone()];
     // c5 receives the rounding remainder (last in loop).
     let percentages = vec![&env, 40u32, 25u32, 15u32, 10u32, 10u32];
 
