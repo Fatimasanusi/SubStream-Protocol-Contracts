@@ -71,22 +71,19 @@ fn calculate_discounted_charge(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    Subscription(Address, Address),
+    Stream(Address, Address),
     TotalStreamed(Address, Address),
     CliffThreshold(Address),
     CreatorSubscribers(Address),
     CreatorMetadata(Address),
     ChannelPaused(Address),
-    GiftsReceived(Address),
-    CreatorSplit(Address),
-    ContractAdmin,
+    Escrow(Address, Address),
+    Nullifier(Bytes),
+    YieldConfig(Address),
+    SLAStatus(Address),               // Merged from main
+    UptimeOracleNonce(u64),           // Merged from main
+    ContractAdmin,                    // Integrated for verify_creator
     VerifiedCreator(Address),
-    CreatorProfileCID(Address),        // For #46
-    NFTAwarded(Address, Address), // (beneficiary, stream_id) - For #44
-    BlacklistedUser(Address, Address), // (creator, user_to_block)
-    CreatorAudience(Address, Address), // (creator, beneficiary)
-    MinimumRate(Address),              // Minimum rate floor for PWYW
-    CommunityGoal(Address),            // Target flow rate for "Bonus Video"
     UserReferrer(Address),
     ReferralTracker(Address, Address),
     CurrentFlowRate(Address),          // Aggregated flow rate for a channel
