@@ -1,8 +1,13 @@
-#![no_std]
+﻿#![no_std]
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
+use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, ScVal, Uint256};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, vec,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+};
+use soroban_sdk::xdr::ToXdr;
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -21,6 +26,11 @@ const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
 const TTL_THRESHOLD: u32 = 17280; // Assuming ~1 day in ledgers for example
 const TTL_BUMP_AMOUNT: u32 = 518400; // Assuming ~30 days in ledgers for example
 
+/// Maximum subscription records per batch import (Soroban CPU / memory limits).
+const MAX_BULK_SUBSCRIPTION_IMPORTS: u32 = 50;
+/// Domain separation for offline import intents (SEP-10â€“style structured payload).
+pub(crate) const BULK_IMPORT_INTENT_PREFIX: &[u8] = b"SubStream:batch_import:v1:";
+
 // --- SLA Circuit Breaker Constants ---
 const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
@@ -29,14 +39,7 @@ const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracl
 // --- Merchant Registry and KYC Whitelisting Constants ---
 const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
-const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
-const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
-const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
-
-// --- Dynamic Protocol Fee Constants ---
-const PROTOCOL_FEE_MAX_BPS: u32 = 500; // Maximum 5% protocol fee (500 basis points)
-const PROTOCOL_FEE_TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 7-day timelock for fee increases
-const DEFAULT_PROTOCOL_FEE_BPS: u32 = 200; // Default 2% protocol fee (200 basis points)
+pub(crate) const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
@@ -94,14 +97,34 @@ pub enum DataKey {
     Nullifier(Bytes),
     NullifierExpirationIndex(u64),    // Index for tracking nullifier expiration cleanup
     YieldConfig(Address),
-    SLAStatus(Address),               // Merged from main
-    UptimeOracleNonce(u64),           // Merged from main
-    ContractAdmin,                    // Integrated for verify_creator
+    SLAStatus(Address),
+    UptimeOracleNonce(u64),
+    ContractAdmin,
     VerifiedCreator(Address),
     UserReferrer(Address),
     ReferralTracker(Address, Address),
-    CurrentFlowRate(Address),          // Aggregated flow rate for a channel
-    AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
+    CurrentFlowRate(Address),
+    AcceptedToken(Address),
+    PlanRegistry(Address),
+    TrialUsed(Address, Address),
+    BillingCycle(Address, Address),
+    BlacklistedUser(Address, Address),
+    MinimumRate(Address),
+    CommunityGoal(Address),
+    CreatorAudience(Address, Address),
+    Subscription(Address, Address),
+    // --- Merchant Registry and KYC Whitelisting Keys ---
+    MerchantRegistry(Address),
+    KYCCredential(Address),
+    DAOProposal(u64),
+    DAOVote(Address, u64),
+    BlacklistedMerchant(Address),
+    /// Last accepted [`BulkImportItem::nonce`] per (subscriber, merchant); must strictly increase.
+    ImportIntentNonce(Address, Address),
+    // --- Global Reentrancy Guard Keys ---
+    ReentrancyGuard,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tier {
@@ -510,12 +533,25 @@ pub struct SubscriptionUpgraded {
     pub upgraded_at: u64,
 }
 
+/// One record in a bulk Web2 â†’ on-chain subscription migration batch.
+/// `user_public_key` must be the 32-byte Ed25519 public key of `user` (G-address owner).
+/// `signature` is an Ed25519 signature over [`bulk_import_intent_message`] (raw bytes, matching Soroban `verify_sig_ed25519`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkImportItem {
+    pub user: Address,
+    pub user_public_key: BytesN<32>,
+    pub plan_id: u32,
+    pub nonce: u64,
+    pub signature: BytesN<64>,
+}
+
 #[contractevent]
-pub struct SubscriptionTransferred {
-    #[topic] pub token_id: u64,
-    #[topic] pub stream_id: Address,
-    #[topic] pub previous_owner: Address,
-    pub new_owner: Address,
+pub struct BatchImportExecuted {
+    #[topic] pub merchant: Address,
+    pub merkle_root: BytesN<32>,
+    pub import_count: u32,
+    pub executed_at: u64,
 }
 
 // --- Merchant Registry and KYC Whitelisting Events ---
@@ -1128,25 +1164,21 @@ impl SubStreamContract {
             .persistent()
             .set(&DataKey::CliffThreshold(creator), &threshold);
     }
+    
+    /// Allow subscriber to cancel with immediate refund if SLA breach exceeds 7 days
+    pub fn emergency_cancel_due_to_sla(env: Env, subscriber: Address, creator: Address) {
+        subscriber.require_auth();
+        let sla_status = get_sla_status(&env, &creator);
 
-    /// Returns `true` when the fan's lifetime contributions to this creator
-    /// meet or exceed the creator's configured cliff threshold.
-    /// Returns `false` if no threshold is set (feature not enabled by creator).
-    pub fn check_cliff_access(env: Env, fan: Address, creator: Address) -> bool {
-        let threshold: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CliffThreshold(creator.clone()))
-            .unwrap_or(0);
-        if threshold == 0 {
-            return false;
+        if sla_status.cumulative_downtime_minutes < 10080 {
+            panic!("SLA emergency cancellation only available after 7+ days of downtime");
         }
-        let contributed: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::UserContributed(fan, creator))
-            .unwrap_or(0);
-        contributed >= threshold
+
+        if !sla_status.active {
+            panic!("SLA emergency cancellation only available during active breach");
+        }
+
+        cancel_internal(&env, &subscriber, &creator);
     }
 
     /// Returns the fan's total lifetime token contributions to a creator.
@@ -1189,11 +1221,12 @@ impl SubStreamContract {
             .get(&plan_registry_key)
             .expect("no plans found");
             
-        let new_plan = plans.iter()
+        let new_plan = plans
+            .iter()
             .find(|p| p.plan_id == new_tier_id && p.is_active)
             .expect("new plan not found or inactive");
-            
-        let old_plan_id = get_current_plan_id(&env, &merchant, billing_info.billing_amount);
+
+        let old_tier_id = get_current_plan_id(&env, &merchant, billing_info.billing_amount);
         
         // Calculate proration
         let now = env.ledger().timestamp();
@@ -2047,13 +2080,164 @@ impl SubStreamContract {
         }
     }
     
-    // Check if nullifier exists (for testing purposes)
-    pub fn is_nullifier_used(env: Env, nullifier: soroban_sdk::Bytes) -> bool {
-        env.storage().persistent().has(&DataKey::Nullifier(nullifier))
+    // Get merchant status
+    pub fn get_merchant_status(env: Env, merchant: Address) -> MerchantStatus {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantRegistry(merchant))
+            .expect("merchant not found")
     }
 
-    fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
-        DataKey::Subscription(subscriber.clone(), stream_id.clone())
+    /// Batch-import subscribers using offline Ed25519 consent payloads (Soroban `verify_sig_ed25519` over [`bulk_import_intent_message`]).
+    /// Each [`BulkImportItem::nonce`] for `(user, merchant)` must be **strictly greater** than the last stored nonce. Any invalid
+    /// signature, wrong key / address binding, or bad nonce **panics the whole host call** (atomic batch).
+    /// Emits [`BatchImportExecuted`] with a Keccak-based binary Merkle root over `(user, plan_id)` leaves.
+    pub fn batch_import_subscriptions(env: Env, merchant: Address, items: Vec<BulkImportItem>) {
+        merchant.require_auth();
+        if !is_merchant_verified(&env, &merchant) {
+            panic!("merchant is not verified");
+        }
+
+        if items.is_empty() {
+            panic!("empty batch");
+        }
+        if items.len() > MAX_BULK_SUBSCRIPTION_IMPORTS {
+            panic!("batch exceeds max imports per transaction");
+        }
+
+        let token = env
+            .storage()
+            .persistent()
+            .get::<Address>(&DataKey::AcceptedToken(merchant.clone()))
+            .expect("merchant must set accepted token before bulk import");
+
+        let contract = env.current_contract_address();
+        let now = env.ledger().timestamp();
+        let mut leaves: Vec<BytesN<32>> = vec![&env];
+
+        for i in 0..items.len() {
+            let item = items.get(i).unwrap();
+            let derived_user = address_from_ed25519_public_key(&env, &item.user_public_key);
+            if derived_user != item.user {
+                panic!("user public key does not match user address");
+            }
+            if item.user == merchant {
+                panic!("invalid self-import");
+            }
+
+            let plan = resolve_plan(&env, &merchant, item.plan_id);
+            let sub_key = subscription_key(&item.user, &merchant);
+            if subscription_exists(&env, &sub_key) {
+                panic!("subscription already exists");
+            }
+            let bill_key = DataKey::BillingCycle(item.user.clone(), merchant.clone());
+            if env.storage().persistent().has(&bill_key) {
+                panic!("billing record already exists");
+            }
+
+            let nonce_key = DataKey::ImportIntentNonce(item.user.clone(), merchant.clone());
+            let last_nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+            if item.nonce <= last_nonce {
+                panic!("import nonce not strictly greater than last");
+            }
+
+            let msg = bulk_import_intent_message(
+                &env,
+                &contract,
+                &merchant,
+                &item.user,
+                item.plan_id,
+                item.nonce,
+            );
+            env.crypto()
+                .ed25519_verify(&item.user_public_key, &msg, &item.signature);
+
+            // --- persist (only after all checks for this item; any panic rolls back full tx) ---
+
+            let rate_per_sec = plan.billing_amount / plan.billing_cycle as i128;
+            if rate_per_sec <= 0 {
+                panic!("invalid plan rate");
+            }
+
+            let trial_dur = if plan.has_trial {
+                plan.trial_duration
+            } else {
+                FREE_TRIAL_DURATION
+            };
+
+            let (status, next_bill) = if plan.has_trial {
+                (
+                    SubscriptionStatus::Trial,
+                    now.saturating_add(plan.trial_duration),
+                )
+            } else {
+                (SubscriptionStatus::Active, now.saturating_add(plan.billing_cycle))
+            };
+
+            let billing = BillingCycleInfo {
+                next_billing_date: next_bill,
+                dunning_start_timestamp: 0,
+                status,
+                billing_amount: plan.billing_amount,
+                billing_cycle: plan.billing_cycle,
+            };
+            env.storage().persistent().set(&bill_key, &billing);
+
+            env.storage().persistent().set(&nonce_key, &item.nonce);
+
+            let mut creators = vec![&env, merchant.clone()];
+            let mut percentages = vec![&env, 100u32];
+            let sub = Subscription {
+                token: token.clone(),
+                tier: Tier {
+                    rate_per_second: rate_per_sec,
+                    trial_duration: trial_dur,
+                },
+                balance: 0,
+                last_collected: now,
+                start_time: now,
+                last_funds_exhausted: 0,
+                free_to_paid_emitted: false,
+                creators: creators.clone(),
+                percentages: percentages.clone(),
+                payer: item.user.clone(),
+                beneficiary: item.user.clone(),
+                accrued_remainder: 0,
+            };
+            set_subscription(&env, &sub_key, &sub);
+
+            let mut total_flow: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::CurrentFlowRate(merchant.clone()))
+                .unwrap_or(0);
+            total_flow = total_flow.saturating_add(rate_per_sec);
+            env.storage()
+                .persistent()
+                .set(&DataKey::CurrentFlowRate(merchant.clone()), &total_flow);
+
+            for j in 0u32..creators.len() {
+                let c = creators.get(j).unwrap();
+                register_creator_support(&env, &c, &item.user);
+            }
+
+            let leaf = bulk_import_leaf_hash(&env, &item.user, item.plan_id);
+            leaves.push_back(leaf);
+        }
+
+        let merkle = merkle_root_from_leaves(&env, &leaves);
+        BatchImportExecuted {
+            merchant: merchant.clone(),
+            merkle_root: merkle,
+            import_count: items.len() as u32,
+            executed_at: now,
+        }
+        .publish(&env);
+    }
+}
+
+fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
+    DataKey::Subscription(subscriber.clone(), stream_id.clone())
 }
 
 fn subscription_exists(env: &Env, key: &DataKey) -> bool {
@@ -2389,7 +2573,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         // flash-subscribe attacks where a user subscribes, scrapes content, and
         // immediately cancels to recover their deposit.
         //
-        // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
+        // Penalty = rate_per_second Ã— MINIMUM_FLOW_DURATION (in internal nano
         // units), capped at the remaining balance so we never overdraw.
         let min_entitled_nano = sub
             .tier
@@ -2686,347 +2870,88 @@ fn get_current_plan_id(env: &Env, merchant: &Address, billing_amount: i128) -> u
     0 // Default plan ID if not found
 }
 
-fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
-    DataKey::Subscription(subscriber.clone(), stream_id.clone())
+fn address_from_ed25519_public_key(env: &Env, pk: &BytesN<32>) -> Address {
+    let u = Uint256(pk.to_array());
+    let aid = AccountId(PublicKey::PublicKeyTypeEd25519(u));
+    let saddr = ScAddress::Account(aid);
+    let scv = ScVal::Address(saddr);
+    let v: Val = scv.into_val(env);
+    Address::try_from_val(env, &v).expect("ed25519 public key does not form a valid account address")
 }
 
-fn wrapped_token_owner(env: &Env, token_id: u64) -> Address {
-    env.storage()
-        .persistent()
-        .get(&DataKey::WrappedTokenOwner(token_id))
-        .expect("wrapped token owner not found")
+pub(crate) fn bulk_import_intent_message(
+    env: &Env,
+    contract: &Address,
+    merchant: &Address,
+    user: &Address,
+    plan_id: u32,
+    nonce: u64,
+) -> Bytes {
+    let mut msg = Bytes::new(env);
+    msg.extend_from_slice(BULK_IMPORT_INTENT_PREFIX);
+    msg.append(&contract.to_xdr(env));
+    msg.append(&merchant.to_xdr(env));
+    msg.append(&user.to_xdr(env));
+    msg.extend_from_slice(&plan_id.to_be_bytes());
+    msg.extend_from_slice(&nonce.to_be_bytes());
+    msg
 }
 
-fn wrapped_subscription_ref(env: &Env, token_id: u64) -> WrappedSubscriptionRef {
-    env.storage()
-        .persistent()
-        .get(&DataKey::WrappedSubscriptionRef(token_id))
-        .expect("wrapped subscription reference not found")
+fn bulk_import_leaf_hash(env: &Env, user: &Address, plan_id: u32) -> BytesN<32> {
+    let mut b = Bytes::new(env);
+    b.append(&user.to_xdr(env));
+    b.extend_from_slice(&plan_id.to_be_bytes());
+    env.crypto().keccak256(&b).to_bytes()
 }
 
-fn subscription_exists(env: &Env, key: &DataKey) -> bool {
-    env.storage().persistent().has(key) || env.storage().temporary().has(key)
-}
-
-fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
-    if let Some(sub) = env.storage().persistent().get(key) {
-        sub
-    } else {
-        env.storage().temporary().get(key).expect("not found")
+/// Binary Merkle (Keccak parent) over the leaf list; if odd, last hash pairs with itself.
+fn merkle_root_from_leaves(env: &Env, leaves: &Vec<BytesN<32>>) -> BytesN<32> {
+    if leaves.is_empty() {
+        return BytesN::from_array(env, &[0u8; 32]);
     }
-}
-
-fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
-    if sub.balance > 0 {
-        env.storage().persistent().set(key, sub);
-        env.storage().temporary().remove(key);
-        // Bump TTL for active subscriptions to keep them from expiring
-        bump_instance_ttl(env);
-        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
-    } else {
-        env.storage().temporary().set(key, sub);
-        env.storage().persistent().remove(key);
-        // Only bump instance TTL if we are moving to temporary storage,
-        // as the temporary entry will expire on its own.
-        bump_instance_ttl(env);
+    let mut level = vec![&env];
+    for i in 0..leaves.len() {
+        level.push_back(leaves.get(i).unwrap().clone());
     }
-}
-
-fn bump_instance_ttl(env: &Env) {
-    // TTL bump functionality not available in this SDK version
-}
-
-fn default_creator_stats() -> CreatorStats {
-    CreatorStats {
-        total_earned: 0,
-        lifetime_fans: 0,
-        active_fans: 0,
+    while level.len() > 1u32 {
+        let mut next = vec![&env];
+        let mut i = 0u32;
+        while i < level.len() {
+            let left = level.get(i).unwrap();
+            let right = if i + 1 < level.len() {
+                level.get(i + 1).unwrap()
+            } else {
+                left
+            };
+            let mut c = Bytes::new(env);
+            c.extend_from_slice(&left.to_array());
+            c.extend_from_slice(&right.to_array());
+            let h = env.crypto().keccak256(&c).to_bytes();
+            next.push_back(h);
+            i += 2;
+        }
+        level = next;
     }
+    level.get(0u32).unwrap().clone()
 }
 
-fn get_creator_stats(env: &Env, creator: &Address) -> CreatorStats {
-    env.storage()
-        .persistent()
-        .get(&DataKey::CreatorMetadata(creator.clone()))
-        .unwrap_or(default_creator_stats())
-}
-
-fn set_creator_stats(env: &Env, creator: &Address, stats: &CreatorStats) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::CreatorMetadata(creator.clone()), stats);
-}
-
-fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
-    let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
-    let mut relationship: CreatorAudience = env
+fn resolve_plan(env: &Env, merchant: &Address, plan_id: u32) -> Plan {
+    let plan_registry_key = DataKey::PlanRegistry(merchant.clone());
+    let plans: Vec<Plan> = env
         .storage()
         .persistent()
-        .get(&relationship_key)
-        .unwrap_or(CreatorAudience {
-            active_streams: 0,
-            has_supported: false,
-        });
-    let mut stats = get_creator_stats(env, creator);
-
-    if !relationship.has_supported {
-        relationship.has_supported = true;
-        stats.lifetime_fans = stats.lifetime_fans.saturating_add(1);
-    }
-
-    if relationship.active_streams == 0 {
-        stats.active_fans = stats.active_fans.saturating_add(1);
-    }
-
-    relationship.active_streams = relationship.active_streams.saturating_add(1);
-    env.storage()
-        .persistent()
-        .set(&relationship_key, &relationship);
-    set_creator_stats(env, creator, &stats);
-}
-
-fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
-    let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
-    let Some(mut relationship): Option<CreatorAudience> =
-        env.storage().persistent().get(&relationship_key)
-    else {
-        return;
-    };
-
-    if relationship.active_streams == 0 {
-        return;
-    }
-
-    relationship.active_streams -= 1;
-
-    let mut stats = get_creator_stats(env, creator);
-    if relationship.active_streams == 0 {
-        stats.active_fans = stats.active_fans.saturating_sub(1);
-    }
-
-    env.storage()
-        .persistent()
-        .set(&relationship_key, &relationship);
-    set_creator_stats(env, creator, &stats);
-}
-
-fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
-    if amount <= 0 {
-        return;
-    }
-
-    let mut stats = get_creator_stats(env, creator);
-    stats.total_earned = stats.total_earned.saturating_add(amount);
-    set_creator_stats(env, creator, &stats);
-}
-
-fn distribute_and_collect(
-    env: &Env,
-    beneficiary: &Address,
-    stream_id: &Address,
-    total_streamed_creator: Option<&Address>,
-) -> i128 {
-    let key = subscription_key(beneficiary, stream_id);
-    let mut sub = get_subscription(env, &key);
-    let now = env.ledger().timestamp();
-
-    if now <= sub.last_collected {
-        return 0;
-    }
-
-    let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
-    if !sub.free_to_paid_emitted && sub.tier.rate_per_second > 0 && now > trial_end {
-        FreeToPaidTierActivated {
-            subscriber: beneficiary.clone(),
-            creator: stream_id.clone(),
-            rate_per_second: sub.tier.rate_per_second,
-            activated_at: now,
-        }
-        .publish(env);
-        sub.free_to_paid_emitted = true;
-    }
-
-    if let Some(creator) = total_streamed_creator {
-        if is_creator_paused(env, creator) {
-            sub.last_collected = now;
-            set_subscription(env, &key, &sub);
-            return 0;
-        }
-    }
-
-    let charge_start = if sub.last_collected > trial_end {
-        sub.last_collected
-    } else {
-        trial_end
-    };
-    if now <= charge_start {
-        return 0;
-    }
-
-    let amount_to_collect =
-        calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
-
-    // Check if grace period is active or expired
-    if sub.balance <= 0 && sub.last_funds_exhausted > 0 {
-        let grace_period_end = sub.last_funds_exhausted.saturating_add(GRACE_PERIOD);
-        if now > grace_period_end {
-            return 0;
-        }
-    }
-
-    if amount_to_collect > sub.balance {
-        if sub.last_funds_exhausted == 0 {
-            sub.last_funds_exhausted = now;
-        }
-        // During grace period, we cap payout at available balance to prevent contract draining
-    }
-
-    let available_balance = sub.balance.max(0);
-    let total_accrued = amount_to_collect.saturating_add(sub.accrued_remainder);
-    let amount_to_payout_nano =
-        total_accrued.min(available_balance.saturating_add(sub.accrued_remainder));
-    let amount_to_payout_tokens = amount_to_payout_nano / PRECISION_MULTIPLIER;
-
-    if amount_to_payout_tokens > 0 {
-        let token_client = TokenClient::new(env, &sub.token);
-        let creators_len = sub.creators.len();
-        let mut remaining = amount_to_payout_tokens;
-
-        // Check for referral rebate before distributing to creators
-        let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
-            // Calculate 1% rebate on the total amount being paid out
-            (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
-        } else {
-            0
-        };
-
-        for i in 0..creators_len {
-            let creator = sub.creators.get(i).unwrap();
-            let share = sub.percentages.get(i).unwrap() as i128;
-            let mut payout = if i + 1 == creators_len {
-                remaining
-            } else {
-                (amount_to_payout_tokens * share) / 100
-            };
-
-            // Apply referral rebate if applicable and this is the first creator
-            if referral_rebate > 0 && i == 0 {
-                if payout > referral_rebate {
-                    payout -= referral_rebate;
-                    pay_referral_rebate(
-                        env,
-                        &sub.beneficiary,
-                        &creator,
-                        &sub.token,
-                        referral_rebate,
-                    );
-                } else {
-                    // If payout is too small for rebate, skip rebate
-                    remaining += referral_rebate; // Add back to remaining for other creators
-                }
+        .get(&plan_registry_key)
+        .expect("no plans for merchant");
+    for j in 0u32..plans.len() {
+        let p = plans.get(j).unwrap();
+        if p.plan_id == plan_id {
+            if !p.is_active {
+                panic!("plan inactive");
             }
-
-            remaining -= payout;
-            if payout > 0 {
-                credit_creator_earnings(env, &creator, payout);
-                token_client.transfer(&env.current_contract_address(), &creator, &payout);
-            }
+            return p;
         }
     }
-
-    sub.balance -= amount_to_collect;
-    sub.accrued_remainder = total_accrued - (amount_to_payout_tokens * PRECISION_MULTIPLIER);
-    sub.last_collected = now;
-    set_subscription(env, &key, &sub);
-    amount_to_collect
-}
-
-fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount: i128) {
-    bump_instance_ttl(env);
-    let key = subscription_key(beneficiary, stream_id);
-    let mut sub = get_subscription(env, &key);
-    sub.payer.require_auth();
-
-    let token_client = TokenClient::new(env, &sub.token);
-    token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
-
-    sub.balance += amount * PRECISION_MULTIPLIER;
-    if sub.balance > 0 {
-        sub.last_funds_exhausted = 0;
-    }
-    set_subscription(env, &key, &sub);
-    distribute_and_collect(env, beneficiary, stream_id, None);
-}
-
-fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
-    bump_instance_ttl(env);
-    let key = subscription_key(beneficiary, stream_id);
-    let mut sub = get_subscription(env, &key);
-    sub.payer.require_auth();
-
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
-
-    // Collect any charges that have accrued so far (zero during the trial window).
-    distribute_and_collect(env, beneficiary, stream_id, None);
-    sub = get_subscription(env, &key); // Refresh after collect.
-
-    // Calculate penalty for early cancellation (optional logic from your existing code, assuming is_early was pseudo-code)
-    let is_early = false; // Add logic here if needed to determine early cancellation based on start_time
-    if is_early {
-        // The creator is entitled to compensation equal to the full minimum-lock
-        // period even though the subscriber is cancelling early.  This prevents
-        // flash-subscribe attacks where a user subscribes, scrapes content, and
-        // immediately cancels to recover their deposit.
-        //
-        // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
-        // units), capped at the remaining balance so we never overdraw.
-        let min_entitled_nano = sub.tier.rate_per_second
-            .saturating_mul(MINIMUM_FLOW_DURATION as i128);
-        let available_nano = sub.balance.max(0);
-        let penalty_nano = min_entitled_nano.min(available_nano);
-        let penalty_tokens = penalty_nano / PRECISION_MULTIPLIER;
-
-        if penalty_tokens > 0 {
-            let token_client = TokenClient::new(env, &sub.token);
-            let creators_len = sub.creators.len();
-            let mut remaining_penalty = penalty_tokens;
-
-            for i in 0..creators_len {
-                let creator = sub.creators.get(i).unwrap();
-                let share = sub.percentages.get(i).unwrap() as i128;
-                let payout = if i + 1 == creators_len {
-                    remaining_penalty
-                } else {
-                    (penalty_tokens * share) / 100
-                };
-                remaining_penalty -= payout;
-                if payout > 0 {
-                    credit_creator_earnings(env, &creator, payout);
-                    token_client.transfer(&env.current_contract_address(), &creator, &payout);
-                }
-            }
-        }
-    }
-
-    let rate = sub.tier.rate_per_second;
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
-    total_flow = total_flow.saturating_sub(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
-
-    if sub.balance > 0 {
-        let token_client = TokenClient::new(&env, &sub.token);
-        let refund_amount = sub.balance / PRECISION_MULTIPLIER;
-        if refund_amount > 0 {
-            token_client.transfer(&env.current_contract_address(), &sub.payer, &refund_amount);
-        }
-    }
-
-    for i in 0..sub.creators.len() {
-        let creator = sub.creators.get(i).unwrap();
-        unregister_creator_support(env, &creator, beneficiary);
-    }
-    env.storage().persistent().remove(&key);
-    env.storage().temporary().remove(&key);
+    panic!("plan not found");
 }
 
 // --- Timelock and Multi-Sig Governance Helper Functions ---
@@ -3320,4 +3245,4 @@ mod test_formal_verification;
 #[cfg(test)]
 mod test_reentrancy_guard;
 #[cfg(test)]
-
+mod test_batch_import;
