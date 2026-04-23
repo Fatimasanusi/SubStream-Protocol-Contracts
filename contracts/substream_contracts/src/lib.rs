@@ -71,6 +71,7 @@ fn calculate_discounted_charge(
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
+    Subscription(Address, Address),
     Stream(Address, Address),
     TotalStreamed(Address, Address),
     CliffThreshold(Address),
@@ -91,6 +92,14 @@ pub enum DataKey {
     PlanRegistry(Address),             // Merchant's pricing plans registry
     TrialUsed(Address, Address),      // (user, merchant) - Prevent trial abuse
     BillingCycle(Address, Address),    // (subscriber, merchant) - Billing cycle info
+    MinimumRate(Address),
+    CommunityGoal(Address),
+    CreatorAudience(Address, Address),
+    BlacklistedUser(Address, Address),
+    WrappedTokenForSubscription(Address, Address), // (beneficiary, stream_id) -> token_id
+    WrappedTokenOwner(u64),                       // token_id -> owner
+    WrappedSubscriptionRef(u64),                  // token_id -> WrappedSubscriptionRef
+    NextWrappedTokenId,
     SLAStatus(Address),               // Creator's SLA status
     UptimeOracleNonce(u64),           // Oracle nonce tracking
     // --- Merchant Registry and KYC Whitelisting Keys ---
@@ -125,6 +134,13 @@ pub struct Subscription {
     pub payer: Address,
     pub beneficiary: Address,
     pub accrued_remainder: i128, // Dust/fractional units that haven't been paid as tokens
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrappedSubscriptionRef {
+    pub beneficiary: Address,
+    pub stream_id: Address,
 }
 
 #[contracttype]
@@ -421,6 +437,14 @@ pub struct SubscriptionUpgraded {
     pub new_tier_id: u32,
     pub prorated_charge: i128,
     pub upgraded_at: u64,
+}
+
+#[contractevent]
+pub struct SubscriptionTransferred {
+    #[topic] pub token_id: u64,
+    #[topic] pub stream_id: Address,
+    #[topic] pub previous_owner: Address,
+    pub new_owner: Address,
 }
 
 // --- Merchant Registry and KYC Whitelisting Events ---
@@ -723,6 +747,120 @@ impl SubStreamContract {
 
     pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
         cancel_internal(&env, &subscriber, &channel_id);
+    }
+
+    /// Optional wrapper: mint an internal NFT-like token ID that represents
+    /// ownership of a specific subscription position.
+    pub fn enable_subscription_transferability(
+        env: Env,
+        beneficiary: Address,
+        stream_id: Address,
+    ) -> u64 {
+        let key = subscription_key(&beneficiary, &stream_id);
+        let sub = get_subscription(&env, &key);
+        sub.payer.require_auth();
+
+        let wrapped_key = DataKey::WrappedTokenForSubscription(beneficiary.clone(), stream_id.clone());
+        if env.storage().persistent().has(&wrapped_key) {
+            panic!("subscription already wrapped");
+        }
+
+        let mut token_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::NextWrappedTokenId)
+            .unwrap_or(1);
+        if token_id == 0 {
+            token_id = 1;
+        }
+
+        let sub_ref = WrappedSubscriptionRef {
+            beneficiary: beneficiary.clone(),
+            stream_id: stream_id.clone(),
+        };
+
+        env.storage().persistent().set(&wrapped_key, &token_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedTokenOwner(token_id), &beneficiary);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedSubscriptionRef(token_id), &sub_ref);
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextWrappedTokenId, &(token_id.saturating_add(1)));
+
+        token_id
+    }
+
+    /// Transfer wrapped subscription rights and billing ownership to a new wallet.
+    pub fn transfer_subscription_token(env: Env, token_id: u64, new_owner: Address) {
+        let current_owner = wrapped_token_owner(&env, token_id);
+        current_owner.require_auth();
+
+        let mut sub_ref = wrapped_subscription_ref(&env, token_id);
+        let stream_id = sub_ref.stream_id.clone();
+
+        if new_owner == current_owner {
+            return;
+        }
+
+        // Settle accrued charges first so users cannot bypass imminent billing.
+        distribute_and_collect(&env, &current_owner, &stream_id, None);
+
+        let old_key = subscription_key(&current_owner, &stream_id);
+        let mut sub = get_subscription(&env, &old_key);
+        sub.payer = new_owner.clone();
+        sub.beneficiary = new_owner.clone();
+        if sub.balance <= 0 && sub.last_funds_exhausted == 0 {
+            sub.last_funds_exhausted = env.ledger().timestamp();
+        }
+
+        let new_key = subscription_key(&new_owner, &stream_id);
+        env.storage().persistent().remove(&old_key);
+        env.storage().temporary().remove(&old_key);
+        set_subscription(&env, &new_key, &sub);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::WrappedTokenForSubscription(current_owner.clone(), stream_id.clone()));
+        env.storage().persistent().set(
+            &DataKey::WrappedTokenForSubscription(new_owner.clone(), stream_id.clone()),
+            &token_id,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedTokenOwner(token_id), &new_owner);
+
+        sub_ref.beneficiary = new_owner.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedSubscriptionRef(token_id), &sub_ref);
+
+        SubscriptionTransferred {
+            token_id,
+            stream_id,
+            previous_owner: current_owner,
+            new_owner,
+        }
+        .publish(&env);
+    }
+
+    /// Ownership-aware access check for wrapped subscriptions.
+    pub fn check_access(env: Env, token_id: u64, user: Address) -> bool {
+        let owner = wrapped_token_owner(&env, token_id);
+        if owner != user {
+            return false;
+        }
+        let sub_ref = wrapped_subscription_ref(&env, token_id);
+        Self::is_subscribed(env, owner, sub_ref.stream_id)
+    }
+
+    /// Ownership-aware pull execution for wrapped subscriptions.
+    pub fn execute_pull(env: Env, token_id: u64) -> i128 {
+        let owner = wrapped_token_owner(&env, token_id);
+        let sub_ref = wrapped_subscription_ref(&env, token_id);
+        distribute_and_collect(&env, &owner, &sub_ref.stream_id, None)
     }
 
     // --- Blacklist functionality for Issue #25 ---
@@ -1773,6 +1911,20 @@ fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
     DataKey::Subscription(subscriber.clone(), stream_id.clone())
 }
 
+fn wrapped_token_owner(env: &Env, token_id: u64) -> Address {
+    env.storage()
+        .persistent()
+        .get(&DataKey::WrappedTokenOwner(token_id))
+        .expect("wrapped token owner not found")
+}
+
+fn wrapped_subscription_ref(env: &Env, token_id: u64) -> WrappedSubscriptionRef {
+    env.storage()
+        .persistent()
+        .get(&DataKey::WrappedSubscriptionRef(token_id))
+        .expect("wrapped subscription reference not found")
+}
+
 fn subscription_exists(env: &Env, key: &DataKey) -> bool {
     env.storage().persistent().has(key) || env.storage().temporary().has(key)
 }
@@ -2270,3 +2422,5 @@ mod test_merchant_registry;
 mod test_formal_verification;
 #[cfg(test)]
 mod test_reentrancy_guard;
+#[cfg(test)]
+mod test_transferable_subscription;
