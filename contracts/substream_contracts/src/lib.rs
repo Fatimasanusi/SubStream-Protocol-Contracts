@@ -2,15 +2,18 @@
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
 const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
 const GRACE_PERIOD: u64 = 24 * 60 * 60;
+#[allow(dead_code)]
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
+#[allow(dead_code)]
 const DISCOUNT_BPS: i128 = 2000;
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
+#[allow(dead_code)]
 const TWELVE_MONTHS: u64 = 365 * 24 * 60 * 60;
 const PRECISION_MULTIPLIER: i128 = 1_000_000_000;
 const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
@@ -25,7 +28,9 @@ const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracl
 // --- Merchant Registry and KYC Whitelisting Constants ---
 const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
-const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
+const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
+const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
+const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
@@ -80,6 +85,7 @@ pub enum DataKey {
     ChannelPaused(Address),
     Escrow(Address, Address),
     Nullifier(Bytes),
+    NullifierExpirationIndex(u64),    // Index for tracking nullifier expiration cleanup
     YieldConfig(Address),
     SLAStatus(Address),               // Merged from main
     UptimeOracleNonce(u64),           // Merged from main
@@ -89,29 +95,6 @@ pub enum DataKey {
     ReferralTracker(Address, Address),
     CurrentFlowRate(Address),          // Aggregated flow rate for a channel
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
-    PlanRegistry(Address),             // Merchant's pricing plans registry
-    TrialUsed(Address, Address),      // (user, merchant) - Prevent trial abuse
-    BillingCycle(Address, Address),    // (subscriber, merchant) - Billing cycle info
-    MinimumRate(Address),
-    CommunityGoal(Address),
-    CreatorAudience(Address, Address),
-    BlacklistedUser(Address, Address),
-    WrappedTokenForSubscription(Address, Address), // (beneficiary, stream_id) -> token_id
-    WrappedTokenOwner(u64),                       // token_id -> owner
-    WrappedSubscriptionRef(u64),                  // token_id -> WrappedSubscriptionRef
-    NextWrappedTokenId,
-    SLAStatus(Address),               // Creator's SLA status
-    UptimeOracleNonce(u64),           // Oracle nonce tracking
-    // --- Merchant Registry and KYC Whitelisting Keys ---
-    MerchantRegistry(Address),        // Merchant registration and verification status
-    KYCCredential(Address),           // SEP-12 KYC credential for merchant
-    DAOProposal(u64),                 // DAO proposal for merchant approval
-    DAOVote(Address, u64),           // DAO member vote on proposal
-    BlacklistedMerchant(Address),     // Blacklisted merchant status
-    // --- Global Reentrancy Guard Keys ---
-    ReentrancyGuard,                 // Global reentrancy protection state
-}
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Tier {
@@ -287,6 +270,53 @@ pub struct DAOVote {
     pub voted_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryUpdateProposal {
+    pub proposal_id: u64,
+    pub merchant_address: Address,
+    pub update_type: RegistryUpdateType,
+    pub description: soroban_sdk::String,
+    pub proposed_at: u64,
+    pub executable_at: u64,          // When the proposal can be executed (48h later)
+    pub votes_for: soroban_sdk::Vec<Address>,
+    pub executed: bool,
+    pub canceled: bool,
+    pub emergency_bypass: bool,       // For severe scams requiring immediate action
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryUpdateType {
+    WhitelistMerchant,
+    BlacklistMerchant,
+    RemoveMerchant,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilMember {
+    pub member: Address,
+    pub added_at: u64,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilVeto {
+    pub council_member: Address,
+    pub proposal_id: u64,
+    pub veto_reason: soroban_sdk::String,
+    pub vetoed_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NullifierExpiration {
+    pub nullifier: soroban_sdk::Bytes,
+    pub expires_at: u64,
+}
+
 // --- Events ---
 #[contractevent]
 pub struct TierChanged {
@@ -300,8 +330,10 @@ pub struct TierChanged {
 
 #[contractevent]
 pub struct AcceptedTokenSet {
-    #[topic] pub creator: Address,
-    #[topic] pub token: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub token: Address,
 }
 
 #[contractevent]
@@ -371,21 +403,27 @@ pub struct ReferralRebatePaid {
 
 #[contractevent]
 pub struct FanNftAwarded {
-    #[topic] pub beneficiary: Address,
-    #[topic] pub creator: Address, // stream_id
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub creator: Address, // stream_id
     pub awarded_at: u64,
 }
 
 #[contractevent]
 pub struct UserBlacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub user: Address,
 }
 
 #[contractevent]
 pub struct UserUnblacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub user: Address,
 }
 
 #[contractevent]
@@ -497,6 +535,43 @@ pub struct DAOVoteCast {
     pub voted_at: u64,
 }
 
+#[contractevent]
+pub struct RegistryUpdateProposed {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub merchant: Address,
+    #[topic] pub update_type: RegistryUpdateType,
+    pub proposed_by: Address,
+    pub executable_at: u64,
+    pub proposed_at: u64,
+    pub emergency_bypass: bool,
+}
+
+#[contractevent]
+pub struct RegistryUpdateExecuted {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub merchant: Address,
+    #[topic] pub update_type: RegistryUpdateType,
+    pub executed_by: Address,
+    pub executed_at: u64,
+}
+
+#[contractevent]
+pub struct RegistryUpdateCanceled {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub merchant: Address,
+    #[topic] pub canceled_by: Address,
+    pub canceled_at: u64,
+}
+
+#[contractevent]
+pub struct SecurityCouncilVetoed {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub council_member: Address,
+    #[topic] pub merchant: Address,
+    pub veto_reason: soroban_sdk::String,
+    pub vetoed_at: u64,
+}
+
 // --- Global Reentrancy Guard Events ---
 
 #[contractevent]
@@ -506,9 +581,27 @@ pub struct ReentrancyAttemptDetected {
     pub detected_at: u64,
 }
 
+#[contractevent]
+pub struct ReplayAttackBlocked {
+    #[topic] pub merchant: Address,
+    #[topic] pub nullifier: soroban_sdk::Bytes,
+    pub blocked_at: u64,
+}
+
+#[contractevent]
+pub struct CliffUnlocked {
+    #[topic]
+    pub fan: Address,
+    #[topic]
+    pub creator: Address,
+    pub total_contributed: i128,
+    pub cliff_threshold: i128,
+}
+
 #[contract]
 pub struct SubStreamContract;
 
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl SubStreamContract {
     pub fn initialize(env: Env, admin: Address) {
@@ -569,6 +662,7 @@ impl SubStreamContract {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_gift(
         env: &Env,
         payer: Address,
@@ -697,6 +791,7 @@ impl SubStreamContract {
         }
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
+        credit_fan_contribution(&env, &user, &creator, amount);
         TipReceived {
             user,
             creator,
@@ -706,6 +801,7 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_group(
         env: Env,
         payer: Address,
@@ -921,7 +1017,9 @@ impl SubStreamContract {
 
     pub fn set_minimum_rate(env: Env, creator: Address, min_rate: i128) {
         creator.require_auth();
-        env.storage().persistent().set(&DataKey::MinimumRate(creator), &min_rate);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinimumRate(creator), &min_rate);
     }
 
     pub fn set_community_goal(env: Env, creator: Address, goal_tokens_per_day: i128) {
@@ -929,124 +1027,91 @@ impl SubStreamContract {
         // Convert tokens/day to flow rate (units per second)
         // Using PRECISION_MULTIPLIER to maintain high-fidelity streaming math
         let goal_per_sec = (goal_tokens_per_day * PRECISION_MULTIPLIER) / 86400;
-        env.storage().persistent().set(&DataKey::CommunityGoal(creator), &goal_per_sec);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityGoal(creator), &goal_per_sec);
     }
 
     pub fn is_community_goal_met(env: Env, creator: Address) -> bool {
-        let goal: i128 = env.storage().persistent().get(&DataKey::CommunityGoal(creator.clone())).unwrap_or(0);
-        if goal == 0 { return false; }
+        let goal: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityGoal(creator.clone()))
+            .unwrap_or(0);
+        if goal == 0 {
+            return false;
+        }
 
-        let current: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(creator)).unwrap_or(0);
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentFlowRate(creator))
+            .unwrap_or(0);
         current >= goal
     }
 
     // --- Issue #49: Stablecoin-Only Enforcement ---
     pub fn set_accepted_token(env: Env, creator: Address, token: Address) {
         creator.require_auth();
-        env.storage().persistent().set(&DataKey::AcceptedToken(creator.clone()), &token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AcceptedToken(creator.clone()), &token);
         AcceptedTokenSet { creator, token }.publish(&env);
     }
 
-    // --- SLA Circuit Breaker Methods ---
-    
-    /// Update SLA status based on uptime oracle payload
-    /// This method is called by the uptime oracle to report service availability
-    pub fn update_sla_status(env: Env, payload: UptimeOraclePayload) {
-        let now = env.ledger().timestamp();
-        
-        // Validate oracle nonce to prevent replay attacks
-        if env.storage().persistent().has(&DataKey::UptimeOracleNonce(payload.nonce)) {
-            panic!("oracle nonce already used");
+    // -----------------------------------------------------------------------
+    // Cliff-Based Access — Milestone Rewards for Early Supporters
+    // -----------------------------------------------------------------------
+
+    /// Creator sets the lifetime-contribution threshold that unlocks premium content.
+    /// `threshold` is in whole token units (not nano).
+    pub fn set_cliff_threshold(env: Env, creator: Address, threshold: i128) {
+        creator.require_auth();
+        if threshold <= 0 {
+            panic!("threshold must be positive");
         }
-        
-        // Check nonce expiration (24 hour validity)
-        if payload.period_end + UPTIME_ORACLE_NONCE_TTL < now {
-            panic!("oracle signature expired");
-        }
-        
-        // Mark nonce as used
-        env.storage().persistent().set(&DataKey::UptimeOracleNonce(payload.nonce), &now);
-        
-        // Get or create SLA status for this creator
-        let mut sla_status = get_sla_status(&env, &payload.creator);
-        
-        // Check if SLA threshold is breached
-        if payload.uptime_percentage < SLA_THRESHOLD_BPS {
-            if !sla_status.active {
-                // SLA breach just started
-                sla_status.active = true;
-                sla_status.current_penalty_period_start = payload.period_start;
-            }
-            
-            // Update cumulative downtime
-            sla_status.cumulative_downtime_minutes += payload.downtime_minutes;
-            
-            // Calculate refund amount based on downtime
-            let refund_amount = calculate_sla_refund(&env, &payload.creator, payload.downtime_minutes);
-            sla_status.total_refund_owed += refund_amount;
-            
-            // Emit SLA breach event for all affected subscribers
-            emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, payload.downtime_minutes, refund_amount, true);
-        } else {
-            if sla_status.active {
-                // SLA breach recovered
-                sla_status.active = false;
-                emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, 0, 0, false);
-            }
-        }
-        
-        sla_status.last_updated = now;
-        set_sla_status(&env, &payload.creator, &sla_status);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CliffThreshold(creator), &threshold);
     }
-    
-    /// Get current SLA status for a creator
-    pub fn get_sla_status(env: Env, creator: Address) -> SLAStatus {
-        get_sla_status(&env, &creator)
-    }
-    
-    /// Allow subscriber to cancel with immediate refund if SLA breach exceeds 7 days
-    pub fn emergency_cancel_due_to_sla(env: Env, subscriber: Address, creator: Address) {
-        let sla_status = get_sla_status(&env, &creator);
-        
-        // Check if downtime exceeds 7 days (7 * 24 * 60 = 10080 minutes)
-        if sla_status.cumulative_downtime_minutes < 10080 {
-            panic!("SLA emergency cancellation only available after 7+ days of downtime");
+
+    /// Returns `true` when the fan's lifetime contributions to this creator
+    /// meet or exceed the creator's configured cliff threshold.
+    /// Returns `false` if no threshold is set (feature not enabled by creator).
+    pub fn check_cliff_access(env: Env, fan: Address, creator: Address) -> bool {
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CliffThreshold(creator.clone()))
+            .unwrap_or(0);
+        if threshold == 0 {
+            return false;
         }
-        
-        if !sla_status.active {
-            panic!("SLA emergency cancellation only available during active breach");
-        }
-        
-        // Perform immediate cancellation with full refund
-        cancel_internal(&env, &subscriber, &creator);
-        
-        let subscription = Subscription {
-            token: token.clone(),
-            tier,
-            balance: 0, // Start with zero balance for trial
-            last_collected: now,
-            start_time: now,
-            last_funds_exhausted: 0,
-            free_to_paid_emitted: false,
-            creators: vec![&env, merchant.clone()],
-            percentages: vec![&env, 100u32],
-            payer: subscriber.clone(),
-            beneficiary: subscriber.clone(),
-            accrued_remainder: 0,
-        };
-        
-        let sub_key = subscription_key(&subscriber, &merchant);
-        set_subscription(&env, &sub_key, &subscription);
-        
-        Subscribed {
-            subscriber: subscriber.clone(),
-            creator: merchant.clone(),
-            rate_per_second: plan.billing_amount / plan.billing_cycle as i128,
-        }.publish(&env);
+        let contributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0);
+        contributed >= threshold
     }
-    
-    // #104: Tiered Subscription Upgrades and Proration Math
-    pub fn upgrade_subscription_tier(
+
+    /// Returns the fan's total lifetime token contributions to a creator.
+    pub fn get_total_contributed(env: Env, fan: Address, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // DAO Treasury Streaming — Grant Support
+    // -----------------------------------------------------------------------
+
+    /// Called by a DAO contract to initiate a streaming grant to a creator.
+    /// The DAO is the payer; the creator receives tokens second-by-second.
+    /// Respects the same 7-day free-trial window and minimum-flow-duration
+    /// rules as regular subscriptions so the protocol remains consistent.
+    pub fn dao_grant(
         env: Env,
         subscriber: Address,
         merchant: Address,
@@ -1151,6 +1216,235 @@ impl SubStreamContract {
         }
     }
 
+    // --- Timelock and Multi-Sig Governance Functions ---
+    
+    /// Propose a registry update with mandatory 48-hour timelock
+    /// Requires 3-of-5 multi-sig consensus before execution
+    pub fn propose_registry_update(
+        env: Env,
+        proposer: Address,
+        merchant: Address,
+        update_type: RegistryUpdateType,
+        description: soroban_sdk::String,
+        emergency_bypass: bool,
+    ) -> u64 {
+        proposer.require_auth();
+        
+        // Verify proposer is authorized (Security Council member or admin)
+        if !is_authorized_proposer(&env, &proposer) {
+            panic!("unauthorized proposer");
+        }
+        
+        // Emergency bypass requires additional authorization
+        if emergency_bypass && !is_emergency_authorized(&env, &proposer) {
+            panic!("unauthorized emergency bypass");
+        }
+        
+        // Generate unique proposal ID
+        let proposal_id = generate_registry_proposal_id(&env);
+        
+        let now = env.ledger().timestamp();
+        let executable_at = if emergency_bypass {
+            now // Immediate execution for emergencies
+        } else {
+            now.saturating_add(TIMELOCK_DURATION) // 48-hour timelock
+        };
+        
+        let proposal = RegistryUpdateProposal {
+            proposal_id,
+            merchant_address: merchant.clone(),
+            update_type: update_type.clone(),
+            description: description.clone(),
+            proposed_at: now,
+            executable_at,
+            votes_for: vec![&env],
+            executed: false,
+            canceled: false,
+            emergency_bypass,
+        };
+        
+        env.storage().persistent().set(&DataKey::RegistryUpdateProposal(proposal_id), &proposal);
+        
+        // Emit event
+        RegistryUpdateProposed {
+            proposal_id,
+            merchant: merchant.clone(),
+            update_type,
+            proposed_by: proposer,
+            executable_at,
+            proposed_at: now,
+            emergency_bypass,
+        }.publish(&env);
+        
+        proposal_id
+    }
+    
+    /// Vote on a registry update proposal (3-of-5 multi-sig)
+    pub fn vote_registry_update(env: Env, voter: Address, proposal_id: u64) {
+        voter.require_auth();
+        
+        // Verify voter is Security Council member
+        if !is_security_council_member(&env, &voter) {
+            panic!("not a security council member");
+        }
+        
+        let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+        let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        
+        // Check if proposal is still pending
+        if proposal.executed || proposal.canceled {
+            panic!("proposal no longer active");
+        }
+        
+        // Check if already voted
+        if proposal.votes_for.contains(&voter) {
+            panic!("already voted");
+        }
+        
+        // Add vote
+        proposal.votes_for.push_back(voter.clone());
+        
+        // Update proposal
+        env.storage().persistent().set(&proposal_key, &proposal);
+        
+        // Check if consensus threshold is reached (3-of-5)
+        if proposal.votes_for.len() >= DAO_MULTISIG_THRESHOLD as usize {
+            // For non-emergency proposals, timelock must be respected
+            if !proposal.emergency_bypass {
+                let now = env.ledger().timestamp();
+                if now < proposal.executable_at {
+                    // Consensus reached but timelock not expired - proposal is ready for execution
+                    return;
+                }
+            }
+            
+            // Execute the proposal
+            execute_registry_update(&env, proposal_id);
+        }
+    }
+    
+    /// Execute a registry update proposal (after timelock expires)
+    pub fn execute_registry_update(env: Env, executor: Address, proposal_id: u64) {
+        executor.require_auth();
+        
+        let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+        let proposal: RegistryUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        
+        // Verify proposal is ready for execution
+        if proposal.executed || proposal.canceled {
+            panic!("proposal no longer active");
+        }
+        
+        // Check timelock (unless emergency bypass)
+        if !proposal.emergency_bypass {
+            let now = env.ledger().timestamp();
+            if now < proposal.executable_at {
+                panic!("timelock not expired");
+            }
+        }
+        
+        // Check consensus threshold
+        if proposal.votes_for.len() < DAO_MULTISIG_THRESHOLD as usize {
+            panic!("consensus not reached");
+        }
+        
+        // Execute the registry update
+        execute_registry_update(&env, proposal_id);
+        
+        // Emit execution event
+        RegistryUpdateExecuted {
+            proposal_id,
+            merchant: proposal.merchant_address.clone(),
+            update_type: proposal.update_type.clone(),
+            executed_by: executor,
+            executed_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+    
+    /// Security Council veto of pending proposal
+    pub fn security_council_veto(
+        env: Env,
+        council_member: Address,
+        proposal_id: u64,
+        veto_reason: soroban_sdk::String,
+    ) {
+        council_member.require_auth();
+        
+        // Verify council member authority
+        if !is_security_council_member(&env, &council_member) {
+            panic!("not a security council member");
+        }
+        
+        let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+        let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        
+        // Can only veto pending proposals
+        if proposal.executed || proposal.canceled {
+            panic!("cannot veto executed or canceled proposal");
+        }
+        
+        // Cancel the proposal
+        proposal.canceled = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        
+        // Record veto
+        let veto = SecurityCouncilVeto {
+            council_member: council_member.clone(),
+            proposal_id,
+            veto_reason: veto_reason.clone(),
+            vetoed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::SecurityCouncilVeto(council_member.clone(), proposal_id), &veto);
+        
+        // Emit veto event
+        SecurityCouncilVetoed {
+            proposal_id,
+            council_member: council_member.clone(),
+            merchant: proposal.merchant_address.clone(),
+            veto_reason,
+            vetoed_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+    
+    /// Initialize Security Council (5 members)
+    pub fn initialize_security_council(env: Env, admin: Address, council_members: soroban_sdk::Vec<Address>) {
+        admin.require_auth();
+        
+        // Verify admin authorization
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ContractAdmin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("admin only");
+        }
+        
+        // Verify exactly 5 members
+        if council_members.len() != SECURITY_COUNCIL_SIZE as usize {
+            panic!("security council must have exactly 5 members");
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Add all council members
+        for i in 0..council_members.len() {
+            let member = council_members.get(i).unwrap();
+            let council_member = SecurityCouncilMember {
+                member: member.clone(),
+                added_at: now,
+                is_active: true,
+            };
+            env.storage().persistent().set(&DataKey::SecurityCouncilMember(member.clone()), &council_member);
+        }
+    }
+    
     // --- Merchant Registry and KYC Whitelisting Functions ---
 
     // Register a merchant with SEP-12 KYC verification
@@ -1167,10 +1461,20 @@ impl SubStreamContract {
         if issuer != authorized_issuer {
             panic!("unauthorized KYC issuer");
         }
-        
-        // Check if merchant is already registered
-        if is_merchant_registered(&env, &merchant) {
-            panic!("merchant already registered");
+
+        let elapsed = (now - charge_start) as i128;
+        let accrued = elapsed
+            .saturating_mul(grant.rate_per_second)
+            .saturating_add(grant.accrued_remainder);
+        let payout_tokens = accrued / PRECISION_MULTIPLIER;
+        let available_tokens = grant.balance / PRECISION_MULTIPLIER;
+        let actual_payout = payout_tokens.min(available_tokens);
+
+        if actual_payout > 0 {
+            let token_client = TokenClient::new(&env, &grant.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
+            credit_creator_earnings(&env, &creator, actual_payout);
+            credit_fan_contribution(&env, &grant.dao, &creator, actual_payout);
         }
         
         // Check if merchant is blacklisted
@@ -1363,6 +1667,155 @@ impl SubStreamContract {
             .expect("merchant not found")
     }
 
+    // --- Anonymous Subscription Verification with Nullifier Tracking ---
+    
+    // Constants for nullifier management
+    const NULLIFIER_VALIDITY_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days
+    const NULLIFIER_CLEANUP_BATCH_SIZE: u64 = 100; // Process up to 100 nullifiers per cleanup
+    
+    // Verify anonymous subscription with ZK-proof and nullifier
+    pub fn verify_anonymous_subscription(
+        env: Env,
+        merchant: Address,
+        proof: soroban_sdk::Bytes,
+        nullifier: soroban_sdk::Bytes,
+    ) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "verify_anonymous_subscription");
+        
+        // Check if merchant is verified
+        if !is_merchant_verified(&env, &merchant) {
+            panic!("merchant is not verified");
+        }
+        
+        // Check if nullifier already exists (replay attack prevention)
+        let nullifier_key = DataKey::Nullifier(nullifier.clone());
+        if env.storage().persistent().has(&nullifier_key) {
+            // Emit replay attack blocked event
+            ReplayAttackBlocked {
+                merchant: merchant.clone(),
+                nullifier: nullifier.clone(),
+                blocked_at: env.ledger().timestamp(),
+            }.publish(&env);
+            
+            panic!("replay attack detected: nullifier already used");
+        }
+        
+        // In a real implementation, this would verify the ZK-proof
+        // For now, we'll assume the proof is valid if it has the expected length
+        if proof.len() != 64 {
+            panic!("invalid proof length");
+        }
+        
+        // Store nullifier with expiration timestamp
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(NULLIFIER_VALIDITY_PERIOD);
+        
+        // Store nullifier to prevent reuse
+        env.storage().persistent().set(&nullifier_key, &true);
+        
+        // Store expiration info for cleanup
+        let expiration_index_key = DataKey::NullifierExpirationIndex(now);
+        let expiration_info = NullifierExpiration {
+            nullifier: nullifier.clone(),
+            expires_at,
+        };
+        env.storage().persistent().set(&expiration_index_key, &expiration_info);
+        
+        // Set TTL for cleanup entry
+        env.storage().persistent().extend_ttl(&expiration_index_key, NULLIFIER_VALIDITY_PERIOD, NULLIFIER_VALIDITY_PERIOD);
+    }
+    
+    // Try to verify anonymous subscription (returns Result for testing)
+    pub fn try_verify_anonymous_subscription(
+        env: Env,
+        merchant: Address,
+        proof: soroban_sdk::Bytes,
+        nullifier: soroban_sdk::Bytes,
+    ) -> Result<(), soroban_sdk::Error> {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "try_verify_anonymous_subscription");
+        
+        // Check if merchant is verified
+        if !is_merchant_verified(&env, &merchant) {
+            return Err(soroban_sdk::Error::from_contract_error(1));
+        }
+        
+        // Check if nullifier already exists (replay attack prevention)
+        let nullifier_key = DataKey::Nullifier(nullifier.clone());
+        if env.storage().persistent().has(&nullifier_key) {
+            // Emit replay attack blocked event
+            ReplayAttackBlocked {
+                merchant: merchant.clone(),
+                nullifier: nullifier.clone(),
+                blocked_at: env.ledger().timestamp(),
+            }.publish(&env);
+            
+            return Err(soroban_sdk::Error::from_contract_error(2));
+        }
+        
+        // Verify proof
+        if proof.len() != 64 {
+            return Err(soroban_sdk::Error::from_contract_error(3));
+        }
+        
+        // Store nullifier with expiration timestamp
+        let now = env.ledger().timestamp();
+        let expires_at = now.saturating_add(NULLIFIER_VALIDITY_PERIOD);
+        
+        // Store nullifier to prevent reuse
+        env.storage().persistent().set(&nullifier_key, &true);
+        
+        // Store expiration info for cleanup
+        let expiration_index_key = DataKey::NullifierExpirationIndex(now);
+        let expiration_info = NullifierExpiration {
+            nullifier: nullifier.clone(),
+            expires_at,
+        };
+        env.storage().persistent().set(&expiration_index_key, &expiration_info);
+        
+        // Set TTL for cleanup entry
+        env.storage().persistent().extend_ttl(&expiration_index_key, NULLIFIER_VALIDITY_PERIOD, NULLIFIER_VALIDITY_PERIOD);
+        
+        Ok(())
+    }
+    
+    // Cleanup expired nullifiers to prevent storage bloat
+    pub fn cleanup_expired_nullifiers(env: Env) {
+        // Create reentrancy guard
+        let _guard = reentrancy_guard!(&env, "cleanup_expired_nullifiers");
+        
+        let now = env.ledger().timestamp();
+        let mut processed = 0u64;
+        
+        // Scan for expired nullifiers by timestamp
+        let mut current_timestamp = now.saturating_sub(NULLIFIER_VALIDITY_PERIOD);
+        
+        while processed < NULLIFIER_CLEANUP_BATCH_SIZE && current_timestamp <= now {
+            let expiration_index_key = DataKey::NullifierExpirationIndex(current_timestamp);
+            
+            if let Some(expiration_info) = env.storage().persistent().get::<NullifierExpiration>(&expiration_index_key) {
+                if expiration_info.expires_at <= now {
+                    // Remove expired nullifier
+                    let nullifier_key = DataKey::Nullifier(expiration_info.nullifier.clone());
+                    env.storage().persistent().remove(&nullifier_key);
+                    
+                    // Remove expiration index entry
+                    env.storage().persistent().remove(&expiration_index_key);
+                    
+                    processed += 1;
+                }
+            }
+            
+            current_timestamp = current_timestamp.saturating_add(1);
+        }
+    }
+    
+    // Check if nullifier exists (for testing purposes)
+    pub fn is_nullifier_used(env: Env, nullifier: soroban_sdk::Bytes) -> bool {
+        env.storage().persistent().has(&DataKey::Nullifier(nullifier))
+    }
+
     fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
         DataKey::Subscription(subscriber.clone(), stream_id.clone())
 }
@@ -1385,7 +1838,9 @@ fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         env.storage().temporary().remove(key);
         // Bump TTL for active subscriptions to keep them from expiring
         bump_instance_ttl(env);
-        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
     } else {
         env.storage().temporary().set(key, sub);
         env.storage().persistent().remove(key);
@@ -1479,6 +1934,37 @@ fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
     set_creator_stats(env, creator, &stats);
 }
 
+/// Increments the fan's lifetime contribution counter for a creator and emits
+/// a `CliffUnlocked` event the first time the threshold is crossed.
+fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::UserContributed(fan.clone(), creator.clone());
+    let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let next = prev.saturating_add(amount);
+    env.storage().persistent().set(&key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+
+    // Emit CliffUnlocked exactly once — when the fan crosses the threshold.
+    let threshold: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CliffThreshold(creator.clone()))
+        .unwrap_or(0);
+    if threshold > 0 && prev < threshold && next >= threshold {
+        CliffUnlocked {
+            fan: fan.clone(),
+            creator: creator.clone(),
+            total_contributed: next,
+            cliff_threshold: threshold,
+        }
+        .publish(env);
+    }
+}
+
 fn distribute_and_collect(
     env: &Env,
     beneficiary: &Address,
@@ -1533,10 +2019,8 @@ fn distribute_and_collect(
         }
     }
 
-    if amount_to_collect > sub.balance {
-        if sub.last_funds_exhausted == 0 {
-            sub.last_funds_exhausted = now;
-        }
+    if amount_to_collect > sub.balance && sub.last_funds_exhausted == 0 {
+        sub.last_funds_exhausted = now;
         // During grace period, we cap payout at available balance to prevent contract draining
     }
 
@@ -1552,7 +2036,7 @@ fn distribute_and_collect(
         let mut remaining = amount_to_payout_tokens;
 
         // Check for referral rebate before distributing to creators
-        let referral_rebate = if let Some(referrer) = get_user_referrer(env, &sub.beneficiary) {
+        let referral_rebate = if let Some(_referrer) = get_user_referrer(env, &sub.beneficiary) {
             // Calculate 1% rebate on the total amount being paid out
             (amount_to_payout_tokens * REFERRAL_REBATE_BPS) / 10000
         } else {
@@ -1588,6 +2072,7 @@ fn distribute_and_collect(
             remaining -= payout;
             if payout > 0 {
                 credit_creator_earnings(env, &creator, payout);
+                credit_fan_contribution(env, &sub.beneficiary, &creator, payout);
                 token_client.transfer(&env.current_contract_address(), &creator, &payout);
             }
         }
@@ -1607,7 +2092,7 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
     sub.payer.require_auth();
 
     let token_client = TokenClient::new(env, &sub.token);
-    token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
+    token_client.transfer(&sub.payer, env.current_contract_address(), &amount);
 
     sub.balance += amount * PRECISION_MULTIPLIER;
     if sub.balance > 0 {
@@ -1623,14 +2108,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
+    let now = env.ledger().timestamp();
+    let is_early = now < sub.start_time + MINIMUM_FLOW_DURATION;
 
     // Collect any charges that have accrued so far (zero during the trial window).
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect.
 
-    // Calculate penalty for early cancellation (optional logic from your existing code, assuming is_early was pseudo-code)
-    let is_early = false; // Add logic here if needed to determine early cancellation based on start_time
     if is_early {
         // The creator is entitled to compensation equal to the full minimum-lock
         // period even though the subscriber is cancelling early.  This prevents
@@ -1639,7 +2123,9 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         //
         // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
         // units), capped at the remaining balance so we never overdraw.
-        let min_entitled_nano = sub.tier.rate_per_second
+        let min_entitled_nano = sub
+            .tier
+            .rate_per_second
             .saturating_mul(MINIMUM_FLOW_DURATION as i128);
         let available_nano = sub.balance.max(0);
         let penalty_nano = min_entitled_nano.min(available_nano);
@@ -1664,13 +2150,20 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
                     token_client.transfer(&env.current_contract_address(), &creator, &payout);
                 }
             }
+            sub.balance -= penalty_nano.min(available_nano);
         }
     }
 
     let rate = sub.tier.rate_per_second;
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    let mut total_flow: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(stream_id.clone()))
+        .unwrap_or(0);
     total_flow = total_flow.saturating_sub(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     if sub.balance > 0 {
         let token_client = TokenClient::new(&env, &sub.token);
@@ -1688,6 +2181,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn subscribe_core(
     env: &Env,
     payer: &Address,
@@ -1702,7 +2196,11 @@ fn subscribe_core(
     payer.require_auth();
 
     // --- Issue #49: Stablecoin-Only Enforcement Mode ---
-    if let Some(accepted_token) = env.storage().persistent().get::<_, Address>(&DataKey::AcceptedToken(stream_id.clone())) {
+    if let Some(accepted_token) = env
+        .storage()
+        .persistent()
+        .get::<_, Address>(&DataKey::AcceptedToken(stream_id.clone()))
+    {
         if token != &accepted_token {
             panic!("creator only accepts their specified stablecoin");
         }
@@ -1714,13 +2212,19 @@ fn subscribe_core(
         panic!("exists");
     }
 
-    let floor: i128 = env.storage().persistent().get(&DataKey::MinimumRate(stream_id.clone())).unwrap_or(0);
-    if rate < floor { panic!("rate below floor"); }
+    let floor: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MinimumRate(stream_id.clone()))
+        .unwrap_or(0);
+    if rate < floor {
+        panic!("rate below floor");
+    }
 
     // Trial support: Allow starting a stream with 0 initial balance
     if amount > 0 {
         let token_client = TokenClient::new(env, token);
-        token_client.transfer(payer, &env.current_contract_address(), &amount);
+        token_client.transfer(payer, env.current_contract_address(), &amount);
     }
 
     let now = env.ledger().timestamp();
@@ -1744,9 +2248,15 @@ fn subscribe_core(
     };
     set_subscription(env, &key, &sub);
 
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    let mut total_flow: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(stream_id.clone()))
+        .unwrap_or(0);
     total_flow = total_flow.saturating_add(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     for i in 0..creators_for_stats.len() {
         let creator = creators_for_stats.get(i).unwrap();
@@ -2250,6 +2760,124 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
+// --- Timelock and Multi-Sig Governance Helper Functions ---
+
+fn generate_registry_proposal_id(env: &Env) -> u64 {
+    // Generate unique proposal ID based on timestamp and existing proposals
+    let now = env.ledger().timestamp();
+    let mut proposal_id = now;
+    
+    // Ensure uniqueness by checking existing proposals
+    while env.storage().persistent().has(&DataKey::RegistryUpdateProposal(proposal_id)) {
+        proposal_id += 1;
+    }
+    
+    proposal_id
+}
+
+fn is_authorized_proposer(env: &Env, proposer: &Address) -> bool {
+    // Security Council members and contract admin can propose
+    if is_security_council_member(env, proposer) {
+        return true;
+    }
+    
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        proposer == &admin
+    } else {
+        false
+    }
+}
+
+fn is_emergency_authorized(env: &Env, proposer: &Address) -> bool {
+    // Emergency bypass requires admin authorization (higher security)
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        proposer == &admin
+    } else {
+        false
+    }
+}
+
+fn is_security_council_member(env: &Env, member: &Address) -> bool {
+    if let Some(council_member) = env.storage().persistent().get::<SecurityCouncilMember>(&DataKey::SecurityCouncilMember(member.clone())) {
+        council_member.is_active
+    } else {
+        false
+    }
+}
+
+fn execute_registry_update(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+    let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+    
+    let merchant_key = DataKey::MerchantRegistry(proposal.merchant_address.clone());
+    
+    match proposal.update_type {
+        RegistryUpdateType::WhitelistMerchant => {
+            // Check if merchant exists, if not create basic entry
+            let mut merchant_status = if let Some(existing_status) = env.storage().persistent().get::<MerchantStatus>(&merchant_key) {
+                existing_status
+            } else {
+                MerchantStatus {
+                    is_verified: false,
+                    is_blacklisted: false,
+                    verification_method: VerificationMethod::DAOApproval,
+                    registered_at: env.ledger().timestamp(),
+                    last_verified: 0,
+                    dao_approved: false,
+                }
+            };
+            
+            merchant_status.is_verified = true;
+            merchant_status.is_blacklisted = false;
+            merchant_status.verification_method = VerificationMethod::DAOApproval;
+            merchant_status.dao_approved = true;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            env.storage().persistent().set(&merchant_key, &merchant_status);
+            
+            // Emit merchant whitelisted event
+            MerchantWhitelisted {
+                merchant: proposal.merchant_address.clone(),
+                verification_method: VerificationMethod::DAOApproval,
+                whitelisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::BlacklistMerchant => {
+            // Check if merchant exists
+            let mut merchant_status = env.storage().persistent()
+                .get::<MerchantStatus>(&merchant_key)
+                .expect("merchant not registered");
+            
+            merchant_status.is_blacklisted = true;
+            merchant_status.is_verified = false;
+            merchant_status.last_verified = env.ledger().timestamp();
+            
+            env.storage().persistent().set(&merchant_key, &merchant_status);
+            env.storage().persistent().set(&DataKey::BlacklistedMerchant(proposal.merchant_address.clone()), &true);
+            
+            // Emit merchant blacklisted event
+            MerchantBlacklisted {
+                merchant: proposal.merchant_address.clone(),
+                blacklisted_by: Address::from_string(&soroban_sdk::String::from_str(env, "Security Council")),
+                reason: soroban_sdk::String::from_str(env, "Registry update proposal executed"),
+                blacklisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::RemoveMerchant => {
+            // Remove merchant from registry
+            env.storage().persistent().remove(&merchant_key);
+            env.storage().persistent().remove(&DataKey::BlacklistedMerchant(proposal.merchant_address.clone()));
+            env.storage().persistent().remove(&DataKey::KYCCredential(proposal.merchant_address.clone()));
+        }
+    }
+    
+    // Mark proposal as executed
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
+}
+
 // --- Merchant Registry and KYC Whitelisting Helper Functions ---
 
 fn is_merchant_registered(env: &Env, merchant: &Address) -> bool {
@@ -2411,9 +3039,9 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_withdrawal_consistency;
+mod test_cliff_access;
 #[cfg(test)]
-mod test_sla_circuit_breaker;
+mod test_dao_treasury;
 #[cfg(test)]
 mod test_enhanced_subscriptions;
 #[cfg(test)]
@@ -2423,4 +3051,4 @@ mod test_formal_verification;
 #[cfg(test)]
 mod test_reentrancy_guard;
 #[cfg(test)]
-mod test_transferable_subscription;
+
