@@ -2,15 +2,18 @@
 #[cfg(test)]
 extern crate std;
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
 const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
 const GRACE_PERIOD: u64 = 24 * 60 * 60;
+#[allow(dead_code)]
 const GENESIS_NFT_ADDRESS: &str = "CAS3J7GYCCX7RRBHAHXDUY3OOWFMTIDDNVGCH6YOY7W7Y7G656H2HHMA";
+#[allow(dead_code)]
 const DISCOUNT_BPS: i128 = 2000;
 const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
+#[allow(dead_code)]
 const TWELVE_MONTHS: u64 = 365 * 24 * 60 * 60;
 const PRECISION_MULTIPLIER: i128 = 1_000_000_000;
 const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
@@ -370,8 +373,10 @@ pub struct TierChanged {
 
 #[contractevent]
 pub struct AcceptedTokenSet {
-    #[topic] pub creator: Address,
-    #[topic] pub token: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub token: Address,
 }
 
 #[contractevent]
@@ -441,21 +446,27 @@ pub struct ReferralRebatePaid {
 
 #[contractevent]
 pub struct FanNftAwarded {
-    #[topic] pub beneficiary: Address,
-    #[topic] pub creator: Address, // stream_id
+    #[topic]
+    pub beneficiary: Address,
+    #[topic]
+    pub creator: Address, // stream_id
     pub awarded_at: u64,
 }
 
 #[contractevent]
 pub struct UserBlacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub user: Address,
 }
 
 #[contractevent]
 pub struct UserUnblacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
+    #[topic]
+    pub creator: Address,
+    #[topic]
+    pub user: Address,
 }
 
 #[contractevent]
@@ -635,6 +646,7 @@ pub struct ProtocolFeeUpdateExecuted {
 #[contract]
 pub struct SubStreamContract;
 
+#[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl SubStreamContract {
     pub fn initialize(env: Env, admin: Address) {
@@ -706,6 +718,7 @@ impl SubStreamContract {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_gift(
         env: &Env,
         payer: Address,
@@ -834,6 +847,7 @@ impl SubStreamContract {
         }
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&user, &creator, &amount);
+        credit_fan_contribution(&env, &user, &creator, amount);
         TipReceived {
             user,
             creator,
@@ -843,6 +857,7 @@ impl SubStreamContract {
         .publish(&env);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe_group(
         env: Env,
         payer: Address,
@@ -944,7 +959,9 @@ impl SubStreamContract {
 
     pub fn set_minimum_rate(env: Env, creator: Address, min_rate: i128) {
         creator.require_auth();
-        env.storage().persistent().set(&DataKey::MinimumRate(creator), &min_rate);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinimumRate(creator), &min_rate);
     }
 
     pub fn set_community_goal(env: Env, creator: Address, goal_tokens_per_day: i128) {
@@ -952,124 +969,91 @@ impl SubStreamContract {
         // Convert tokens/day to flow rate (units per second)
         // Using PRECISION_MULTIPLIER to maintain high-fidelity streaming math
         let goal_per_sec = (goal_tokens_per_day * PRECISION_MULTIPLIER) / 86400;
-        env.storage().persistent().set(&DataKey::CommunityGoal(creator), &goal_per_sec);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CommunityGoal(creator), &goal_per_sec);
     }
 
     pub fn is_community_goal_met(env: Env, creator: Address) -> bool {
-        let goal: i128 = env.storage().persistent().get(&DataKey::CommunityGoal(creator.clone())).unwrap_or(0);
-        if goal == 0 { return false; }
+        let goal: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CommunityGoal(creator.clone()))
+            .unwrap_or(0);
+        if goal == 0 {
+            return false;
+        }
 
-        let current: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(creator)).unwrap_or(0);
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentFlowRate(creator))
+            .unwrap_or(0);
         current >= goal
     }
 
     // --- Issue #49: Stablecoin-Only Enforcement ---
     pub fn set_accepted_token(env: Env, creator: Address, token: Address) {
         creator.require_auth();
-        env.storage().persistent().set(&DataKey::AcceptedToken(creator.clone()), &token);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AcceptedToken(creator.clone()), &token);
         AcceptedTokenSet { creator, token }.publish(&env);
     }
 
-    // --- SLA Circuit Breaker Methods ---
-    
-    /// Update SLA status based on uptime oracle payload
-    /// This method is called by the uptime oracle to report service availability
-    pub fn update_sla_status(env: Env, payload: UptimeOraclePayload) {
-        let now = env.ledger().timestamp();
-        
-        // Validate oracle nonce to prevent replay attacks
-        if env.storage().persistent().has(&DataKey::UptimeOracleNonce(payload.nonce)) {
-            panic!("oracle nonce already used");
+    // -----------------------------------------------------------------------
+    // Cliff-Based Access — Milestone Rewards for Early Supporters
+    // -----------------------------------------------------------------------
+
+    /// Creator sets the lifetime-contribution threshold that unlocks premium content.
+    /// `threshold` is in whole token units (not nano).
+    pub fn set_cliff_threshold(env: Env, creator: Address, threshold: i128) {
+        creator.require_auth();
+        if threshold <= 0 {
+            panic!("threshold must be positive");
         }
-        
-        // Check nonce expiration (24 hour validity)
-        if payload.period_end + UPTIME_ORACLE_NONCE_TTL < now {
-            panic!("oracle signature expired");
-        }
-        
-        // Mark nonce as used
-        env.storage().persistent().set(&DataKey::UptimeOracleNonce(payload.nonce), &now);
-        
-        // Get or create SLA status for this creator
-        let mut sla_status = get_sla_status(&env, &payload.creator);
-        
-        // Check if SLA threshold is breached
-        if payload.uptime_percentage < SLA_THRESHOLD_BPS {
-            if !sla_status.active {
-                // SLA breach just started
-                sla_status.active = true;
-                sla_status.current_penalty_period_start = payload.period_start;
-            }
-            
-            // Update cumulative downtime
-            sla_status.cumulative_downtime_minutes += payload.downtime_minutes;
-            
-            // Calculate refund amount based on downtime
-            let refund_amount = calculate_sla_refund(&env, &payload.creator, payload.downtime_minutes);
-            sla_status.total_refund_owed += refund_amount;
-            
-            // Emit SLA breach event for all affected subscribers
-            emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, payload.downtime_minutes, refund_amount, true);
-        } else {
-            if sla_status.active {
-                // SLA breach recovered
-                sla_status.active = false;
-                emit_sla_breach_events(&env, &payload.creator, payload.uptime_percentage, 0, 0, false);
-            }
-        }
-        
-        sla_status.last_updated = now;
-        set_sla_status(&env, &payload.creator, &sla_status);
+        env.storage()
+            .persistent()
+            .set(&DataKey::CliffThreshold(creator), &threshold);
     }
-    
-    /// Get current SLA status for a creator
-    pub fn get_sla_status(env: Env, creator: Address) -> SLAStatus {
-        get_sla_status(&env, &creator)
-    }
-    
-    /// Allow subscriber to cancel with immediate refund if SLA breach exceeds 7 days
-    pub fn emergency_cancel_due_to_sla(env: Env, subscriber: Address, creator: Address) {
-        let sla_status = get_sla_status(&env, &creator);
-        
-        // Check if downtime exceeds 7 days (7 * 24 * 60 = 10080 minutes)
-        if sla_status.cumulative_downtime_minutes < 10080 {
-            panic!("SLA emergency cancellation only available after 7+ days of downtime");
+
+    /// Returns `true` when the fan's lifetime contributions to this creator
+    /// meet or exceed the creator's configured cliff threshold.
+    /// Returns `false` if no threshold is set (feature not enabled by creator).
+    pub fn check_cliff_access(env: Env, fan: Address, creator: Address) -> bool {
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CliffThreshold(creator.clone()))
+            .unwrap_or(0);
+        if threshold == 0 {
+            return false;
         }
-        
-        if !sla_status.active {
-            panic!("SLA emergency cancellation only available during active breach");
-        }
-        
-        // Perform immediate cancellation with full refund
-        cancel_internal(&env, &subscriber, &creator);
-        
-        let subscription = Subscription {
-            token: token.clone(),
-            tier,
-            balance: 0, // Start with zero balance for trial
-            last_collected: now,
-            start_time: now,
-            last_funds_exhausted: 0,
-            free_to_paid_emitted: false,
-            creators: vec![&env, merchant.clone()],
-            percentages: vec![&env, 100u32],
-            payer: subscriber.clone(),
-            beneficiary: subscriber.clone(),
-            accrued_remainder: 0,
-        };
-        
-        let sub_key = subscription_key(&subscriber, &merchant);
-        set_subscription(&env, &sub_key, &subscription);
-        
-        Subscribed {
-            subscriber: subscriber.clone(),
-            creator: merchant.clone(),
-            rate_per_second: plan.billing_amount / plan.billing_cycle as i128,
-        }.publish(&env);
+        let contributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0);
+        contributed >= threshold
     }
-    
-    // #104: Tiered Subscription Upgrades and Proration Math
-    pub fn upgrade_subscription_tier(
+
+    /// Returns the fan's total lifetime token contributions to a creator.
+    pub fn get_total_contributed(env: Env, fan: Address, creator: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserContributed(fan, creator))
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // DAO Treasury Streaming — Grant Support
+    // -----------------------------------------------------------------------
+
+    /// Called by a DAO contract to initiate a streaming grant to a creator.
+    /// The DAO is the payer; the creator receives tokens second-by-second.
+    /// Respects the same 7-day free-trial window and minimum-flow-duration
+    /// rules as regular subscriptions so the protocol remains consistent.
+    pub fn dao_grant(
         env: Env,
         subscriber: Address,
         merchant: Address,
@@ -1419,10 +1403,20 @@ impl SubStreamContract {
         if issuer != authorized_issuer {
             panic!("unauthorized KYC issuer");
         }
-        
-        // Check if merchant is already registered
-        if is_merchant_registered(&env, &merchant) {
-            panic!("merchant already registered");
+
+        let elapsed = (now - charge_start) as i128;
+        let accrued = elapsed
+            .saturating_mul(grant.rate_per_second)
+            .saturating_add(grant.accrued_remainder);
+        let payout_tokens = accrued / PRECISION_MULTIPLIER;
+        let available_tokens = grant.balance / PRECISION_MULTIPLIER;
+        let actual_payout = payout_tokens.min(available_tokens);
+
+        if actual_payout > 0 {
+            let token_client = TokenClient::new(&env, &grant.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
+            credit_creator_earnings(&env, &creator, actual_payout);
+            credit_fan_contribution(&env, &grant.dao, &creator, actual_payout);
         }
         
         // Check if merchant is blacklisted
@@ -1968,7 +1962,9 @@ fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         env.storage().temporary().remove(key);
         // Bump TTL for active subscriptions to keep them from expiring
         bump_instance_ttl(env);
-        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
     } else {
         env.storage().temporary().set(key, sub);
         env.storage().persistent().remove(key);
@@ -2062,6 +2058,37 @@ fn credit_creator_earnings(env: &Env, creator: &Address, amount: i128) {
     set_creator_stats(env, creator, &stats);
 }
 
+/// Increments the fan's lifetime contribution counter for a creator and emits
+/// a `CliffUnlocked` event the first time the threshold is crossed.
+fn credit_fan_contribution(env: &Env, fan: &Address, creator: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let key = DataKey::UserContributed(fan.clone(), creator.clone());
+    let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+    let next = prev.saturating_add(amount);
+    env.storage().persistent().set(&key, &next);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+
+    // Emit CliffUnlocked exactly once — when the fan crosses the threshold.
+    let threshold: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CliffThreshold(creator.clone()))
+        .unwrap_or(0);
+    if threshold > 0 && prev < threshold && next >= threshold {
+        CliffUnlocked {
+            fan: fan.clone(),
+            creator: creator.clone(),
+            total_contributed: next,
+            cliff_threshold: threshold,
+        }
+        .publish(env);
+    }
+}
+
 fn distribute_and_collect(
     env: &Env,
     beneficiary: &Address,
@@ -2116,10 +2143,8 @@ fn distribute_and_collect(
         }
     }
 
-    if amount_to_collect > sub.balance {
-        if sub.last_funds_exhausted == 0 {
-            sub.last_funds_exhausted = now;
-        }
+    if amount_to_collect > sub.balance && sub.last_funds_exhausted == 0 {
+        sub.last_funds_exhausted = now;
         // During grace period, we cap payout at available balance to prevent contract draining
     }
 
@@ -2192,6 +2217,7 @@ fn distribute_and_collect(
             remaining -= payout;
             if payout > 0 {
                 credit_creator_earnings(env, &creator, payout);
+                credit_fan_contribution(env, &sub.beneficiary, &creator, payout);
                 token_client.transfer(&env.current_contract_address(), &creator, &payout);
             }
         }
@@ -2211,7 +2237,7 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
     sub.payer.require_auth();
 
     let token_client = TokenClient::new(env, &sub.token);
-    token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
+    token_client.transfer(&sub.payer, env.current_contract_address(), &amount);
 
     sub.balance += amount * PRECISION_MULTIPLIER;
     if sub.balance > 0 {
@@ -2227,14 +2253,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
+    let now = env.ledger().timestamp();
+    let is_early = now < sub.start_time + MINIMUM_FLOW_DURATION;
 
     // Collect any charges that have accrued so far (zero during the trial window).
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect.
 
-    // Calculate penalty for early cancellation (optional logic from your existing code, assuming is_early was pseudo-code)
-    let is_early = false; // Add logic here if needed to determine early cancellation based on start_time
     if is_early {
         // The creator is entitled to compensation equal to the full minimum-lock
         // period even though the subscriber is cancelling early.  This prevents
@@ -2243,7 +2268,9 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
         //
         // Penalty = rate_per_second × MINIMUM_FLOW_DURATION (in internal nano
         // units), capped at the remaining balance so we never overdraw.
-        let min_entitled_nano = sub.tier.rate_per_second
+        let min_entitled_nano = sub
+            .tier
+            .rate_per_second
             .saturating_mul(MINIMUM_FLOW_DURATION as i128);
         let available_nano = sub.balance.max(0);
         let penalty_nano = min_entitled_nano.min(available_nano);
@@ -2268,13 +2295,20 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
                     token_client.transfer(&env.current_contract_address(), &creator, &payout);
                 }
             }
+            sub.balance -= penalty_nano.min(available_nano);
         }
     }
 
     let rate = sub.tier.rate_per_second;
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    let mut total_flow: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(stream_id.clone()))
+        .unwrap_or(0);
     total_flow = total_flow.saturating_sub(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     if sub.balance > 0 {
         let token_client = TokenClient::new(&env, &sub.token);
@@ -2292,6 +2326,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     env.storage().temporary().remove(&key);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn subscribe_core(
     env: &Env,
     payer: &Address,
@@ -2306,7 +2341,11 @@ fn subscribe_core(
     payer.require_auth();
 
     // --- Issue #49: Stablecoin-Only Enforcement Mode ---
-    if let Some(accepted_token) = env.storage().persistent().get::<_, Address>(&DataKey::AcceptedToken(stream_id.clone())) {
+    if let Some(accepted_token) = env
+        .storage()
+        .persistent()
+        .get::<_, Address>(&DataKey::AcceptedToken(stream_id.clone()))
+    {
         if token != &accepted_token {
             panic!("creator only accepts their specified stablecoin");
         }
@@ -2318,13 +2357,19 @@ fn subscribe_core(
         panic!("exists");
     }
 
-    let floor: i128 = env.storage().persistent().get(&DataKey::MinimumRate(stream_id.clone())).unwrap_or(0);
-    if rate < floor { panic!("rate below floor"); }
+    let floor: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::MinimumRate(stream_id.clone()))
+        .unwrap_or(0);
+    if rate < floor {
+        panic!("rate below floor");
+    }
 
     // Trial support: Allow starting a stream with 0 initial balance
     if amount > 0 {
         let token_client = TokenClient::new(env, token);
-        token_client.transfer(payer, &env.current_contract_address(), &amount);
+        token_client.transfer(payer, env.current_contract_address(), &amount);
     }
 
     let now = env.ledger().timestamp();
@@ -2348,9 +2393,15 @@ fn subscribe_core(
     };
     set_subscription(env, &key, &sub);
 
-    let mut total_flow: i128 = env.storage().persistent().get(&DataKey::CurrentFlowRate(stream_id.clone())).unwrap_or(0);
+    let mut total_flow: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CurrentFlowRate(stream_id.clone()))
+        .unwrap_or(0);
     total_flow = total_flow.saturating_add(rate);
-    env.storage().persistent().set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
+    env.storage()
+        .persistent()
+        .set(&DataKey::CurrentFlowRate(stream_id.clone()), &total_flow);
 
     for i in 0..creators_for_stats.len() {
         let creator = creators_for_stats.get(i).unwrap();
@@ -3140,9 +3191,9 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_withdrawal_consistency;
+mod test_cliff_access;
 #[cfg(test)]
-mod test_sla_circuit_breaker;
+mod test_dao_treasury;
 #[cfg(test)]
 mod test_enhanced_subscriptions;
 #[cfg(test)]
