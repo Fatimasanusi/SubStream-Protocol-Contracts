@@ -2198,3 +2198,5 @@ mod test_sla_circuit_breaker;
 mod test_enhanced_subscriptions;
 #[cfg(test)]
 mod test_merchant_registry;
+#[cfg(test)]
+mod test_formal_verification;
