@@ -9,7 +9,13 @@ use soroban_sdk::{
 const DAY: u64 = 24 * 60 * 60;
 const WEEK: u64 = 7 * DAY;
 
-fn setup() -> (Env, SubStreamContractClient<'static>, token::Client<'static>, Address, Address) {
+fn setup() -> (
+    Env,
+    SubStreamContractClient<'static>,
+    token::Client<'static>,
+    Address,
+    Address,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -128,7 +134,10 @@ fn test_revoke_grant_refunds_unstreamed_balance() {
 
     // DAO should have been refunded most of the deposit
     let dao_balance_after = token.balance(&dao);
-    assert!(dao_balance_after > dao_balance_before, "DAO should receive a refund");
+    assert!(
+        dao_balance_after > dao_balance_before,
+        "DAO should receive a refund"
+    );
 
     // Creator should have received the streamed portion (only post-trial seconds)
     // Trial = 7 days; revoke at 1 day + 1 sec → still in trial → creator gets 0

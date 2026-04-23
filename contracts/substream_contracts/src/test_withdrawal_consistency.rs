@@ -1,10 +1,10 @@
 #![cfg(test)]
 
+use super::{SubStreamContract, SubStreamContractClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, vec, Address, Env, Vec,
 };
-use super::{SubStreamContract, SubStreamContractClient};
 
 const DAY: u64 = 24 * 60 * 60;
 const WEEK: u64 = 7 * DAY;
@@ -99,7 +99,8 @@ fn test_withdrawal_consistency_high_load() {
                 assert!(
                     contract_balance_before >= 0,
                     "CRITICAL: Vault balance went negative before cancellation #{}: {}",
-                    i, contract_balance_before
+                    i,
+                    contract_balance_before
                 );
 
                 // Cancel subscription - this refunds remaining balance
@@ -168,7 +169,14 @@ fn test_withdrawal_consistency_edge_cases() {
     // Test edge case: large amounts
     let subscriber2 = Address::generate(&env);
     token_admin.mint(&subscriber2, &1000000);
-    client.subscribe(&subscriber2, &creator, &sac.address(), &500000, &1000, &None);
+    client.subscribe(
+        &subscriber2,
+        &creator,
+        &sac.address(),
+        &500000,
+        &1000,
+        &None,
+    );
 
     // Test edge case: high rate
     let subscriber3 = Address::generate(&env);
@@ -184,17 +192,29 @@ fn test_withdrawal_consistency_edge_cases() {
 
     // Cancel all
     client.cancel(&subscriber1, &creator);
-    
+
     let balance_after_cancel1 = token_client.balance(&contract_id);
-    assert!(balance_after_cancel1 >= 0, "Vault negative after cancel1: {}", balance_after_cancel1);
+    assert!(
+        balance_after_cancel1 >= 0,
+        "Vault negative after cancel1: {}",
+        balance_after_cancel1
+    );
 
     client.cancel(&subscriber2, &creator);
-    
+
     let balance_after_cancel2 = token_client.balance(&contract_id);
-    assert!(balance_after_cancel2 >= 0, "Vault negative after cancel2: {}", balance_after_cancel2);
+    assert!(
+        balance_after_cancel2 >= 0,
+        "Vault negative after cancel2: {}",
+        balance_after_cancel2
+    );
 
     client.cancel(&subscriber3, &creator);
-    
+
     let final_balance = token_client.balance(&contract_id);
-    assert!(final_balance >= 0, "Vault negative after cancel3: {}", final_balance);
+    assert!(
+        final_balance >= 0,
+        "Vault negative after cancel3: {}",
+        final_balance
+    );
 }
