@@ -55,7 +55,7 @@ fn test_withdrawal_consistency_high_load() {
         let rate: i128 = 1 + ((i as i128 * 13) % 100);
 
         // Subscribe
-        client.subscribe(&subscriber, &creator, &sac.address(), &amount, &rate);
+        client.subscribe(&subscriber, &creator, &sac.address(), &amount, &rate, &None);
     }
 
     // Verify initial vault balance
@@ -163,17 +163,17 @@ fn test_withdrawal_consistency_edge_cases() {
     // Test edge case: minimum amounts
     let subscriber1 = Address::generate(&env);
     token_admin.mint(&subscriber1, &1000);
-    client.subscribe(&subscriber1, &creator, &sac.address(), &100, &1);
+    client.subscribe(&subscriber1, &creator, &sac.address(), &100, &1, &None);
 
     // Test edge case: large amounts
     let subscriber2 = Address::generate(&env);
     token_admin.mint(&subscriber2, &1000000);
-    client.subscribe(&subscriber2, &creator, &sac.address(), &500000, &1000);
+    client.subscribe(&subscriber2, &creator, &sac.address(), &500000, &1000, &None);
 
     // Test edge case: high rate
     let subscriber3 = Address::generate(&env);
     token_admin.mint(&subscriber3, &10000);
-    client.subscribe(&subscriber3, &creator, &sac.address(), &5000, &500);
+    client.subscribe(&subscriber3, &creator, &sac.address(), &5000, &500, &None);
 
     env.ledger().set_timestamp(100 + WEEK + DAY);
 

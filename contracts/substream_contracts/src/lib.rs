@@ -81,6 +81,7 @@ pub enum DataKey {
     ReferralTracker(Address, Address),
     CurrentFlowRate(Address),          // Aggregated flow rate for a channel
     AcceptedToken(Address),            // Issue #49: Creator's enforced stablecoin token
+    DaoGrant(Address, Address),        // (dao, creator) — DAO treasury grant stream
 }
 
 #[contracttype]
@@ -135,6 +136,20 @@ pub struct ReferralInfo {
     pub referrer: Address,
     pub referral_count: u32,
     pub total_rebates_earned: i128,
+}
+
+/// A DAO treasury grant stream — the DAO acts as payer, the creator is the beneficiary.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaoGrant {
+    pub dao: Address,
+    pub creator: Address,
+    pub token: Address,
+    pub rate_per_second: i128,
+    pub balance: i128,
+    pub start_time: u64,
+    pub last_collected: u64,
+    pub accrued_remainder: i128,
 }
 
 // --- Events ---
@@ -236,6 +251,21 @@ pub struct UserBlacklisted {
 pub struct UserUnblacklisted {
     #[topic] pub creator: Address,
     #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct GrantInitiated {
+    #[topic] pub dao: Address,
+    #[topic] pub creator: Address,
+    pub rate_per_second: i128,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct GrantRevoked {
+    #[topic] pub dao: Address,
+    #[topic] pub creator: Address,
+    pub refund_amount: i128,
 }
 
 
@@ -560,12 +590,157 @@ impl SubStreamContract {
         env.storage().persistent().set(&DataKey::AcceptedToken(creator.clone()), &token);
         AcceptedTokenSet { creator, token }.publish(&env);
     }
+
+    // -----------------------------------------------------------------------
+    // DAO Treasury Streaming — Grant Support
+    // -----------------------------------------------------------------------
+
+    /// Called by a DAO contract to initiate a streaming grant to a creator.
+    /// The DAO is the payer; the creator receives tokens second-by-second.
+    /// Respects the same 7-day free-trial window and minimum-flow-duration
+    /// rules as regular subscriptions so the protocol remains consistent.
+    pub fn dao_grant(
+        env: Env,
+        dao: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        rate_per_second: i128,
+    ) {
+        dao.require_auth();
+
+        if amount <= 0 {
+            panic!("grant amount must be positive");
+        }
+        if rate_per_second <= 0 {
+            panic!("grant rate must be positive");
+        }
+
+        let key = DataKey::DaoGrant(dao.clone(), creator.clone());
+        if env.storage().persistent().has(&key) {
+            panic!("grant already active");
+        }
+
+        let token_client = TokenClient::new(&env, &token);
+        token_client.transfer(&dao, &env.current_contract_address(), &amount);
+
+        let now = env.ledger().timestamp();
+        let grant = DaoGrant {
+            dao: dao.clone(),
+            creator: creator.clone(),
+            token,
+            rate_per_second,
+            balance: amount * PRECISION_MULTIPLIER,
+            start_time: now,
+            last_collected: now,
+            accrued_remainder: 0,
+        };
+        env.storage().persistent().set(&key, &grant);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+
+        register_creator_support(&env, &creator, &dao);
+
+        GrantInitiated { dao, creator, rate_per_second, amount }.publish(&env);
+    }
+
+    /// Creator calls this to collect accrued grant tokens.
+    /// Anyone may trigger collection; tokens always flow to the creator.
+    pub fn collect_grant(env: Env, dao: Address, creator: Address) {
+        let key = DataKey::DaoGrant(dao.clone(), creator.clone());
+        let mut grant: DaoGrant = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("grant not found");
+
+        let now = env.ledger().timestamp();
+        if now <= grant.last_collected {
+            return;
+        }
+
+        // Honour the 7-day free-trial: no charges before trial_end.
+        let trial_end = grant.start_time.saturating_add(FREE_TRIAL_DURATION);
+        let charge_start = grant.last_collected.max(trial_end);
+        if now <= charge_start {
+            grant.last_collected = now;
+            env.storage().persistent().set(&key, &grant);
+            return;
+        }
+
+        let elapsed = (now - charge_start) as i128;
+        let accrued = elapsed
+            .saturating_mul(grant.rate_per_second)
+            .saturating_add(grant.accrued_remainder);
+        let payout_tokens = accrued / PRECISION_MULTIPLIER;
+        let available_tokens = grant.balance / PRECISION_MULTIPLIER;
+        let actual_payout = payout_tokens.min(available_tokens);
+
+        if actual_payout > 0 {
+            let token_client = TokenClient::new(&env, &grant.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
+            credit_creator_earnings(&env, &creator, actual_payout);
+        }
+
+        grant.balance -= (elapsed.saturating_mul(grant.rate_per_second)).min(grant.balance);
+        grant.accrued_remainder = accrued - (actual_payout * PRECISION_MULTIPLIER);
+        grant.last_collected = now;
+
+        if grant.balance <= 0 {
+            env.storage().persistent().remove(&key);
+            unregister_creator_support(&env, &creator, &dao);
+        } else {
+            env.storage().persistent().set(&key, &grant);
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+        }
+    }
+
+    /// DAO revokes an active grant after the minimum flow duration has elapsed.
+    /// Any unstreamed balance is refunded to the DAO treasury.
+    pub fn revoke_grant(env: Env, dao: Address, creator: Address) {
+        dao.require_auth();
+
+        let key = DataKey::DaoGrant(dao.clone(), creator.clone());
+        let grant: DaoGrant = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("grant not found");
+
+        if env.ledger().timestamp() < grant.start_time + MINIMUM_FLOW_DURATION {
+            panic!("cannot revoke grant: minimum duration not met");
+        }
+
+        // Collect any accrued amount before revoking.
+        Self::collect_grant(env.clone(), dao.clone(), creator.clone());
+
+        // Re-read after collect (grant may have been removed if balance hit zero).
+        let remaining_balance = env
+            .storage()
+            .persistent()
+            .get::<_, DaoGrant>(&key)
+            .map(|g| g.balance)
+            .unwrap_or(0);
+
+        if remaining_balance > 0 {
+            let refund_tokens = remaining_balance / PRECISION_MULTIPLIER;
+            if refund_tokens > 0 {
+                let grant_after: DaoGrant = env.storage().persistent().get(&key).unwrap();
+                let token_client = TokenClient::new(&env, &grant_after.token);
+                token_client.transfer(&env.current_contract_address(), &dao, &refund_tokens);
+            }
+            env.storage().persistent().remove(&key);
+            unregister_creator_support(&env, &creator, &dao);
+        }
+
+        GrantRevoked { dao, creator, refund_amount: remaining_balance / PRECISION_MULTIPLIER }
+            .publish(&env);
+    }
 }
 
 // --- Internal Logic & Helpers ---
 
 fn bump_instance_ttl(env: &Env) {
-    env.storage().instance().bump(TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP_AMOUNT);
 }
 
 fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
@@ -590,7 +765,7 @@ fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         env.storage().temporary().remove(key);
         // Bump TTL for active subscriptions to keep them from expiring
         bump_instance_ttl(env);
-        env.storage().persistent().bump(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
     } else {
         env.storage().temporary().set(key, sub);
         env.storage().persistent().remove(key);
@@ -828,14 +1003,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let mut sub = get_subscription(env, &key);
     sub.payer.require_auth();
 
-    if env.ledger().timestamp() < sub.start_time + MINIMUM_FLOW_DURATION { panic!("cannot cancel stream: minimum duration not met"); }
+    let now = env.ledger().timestamp();
+    let is_early = now < sub.start_time + MINIMUM_FLOW_DURATION;
 
     // Collect any charges that have accrued so far (zero during the trial window).
     distribute_and_collect(env, beneficiary, stream_id, None);
     sub = get_subscription(env, &key); // Refresh after collect.
 
-    // Calculate penalty for early cancellation (optional logic from your existing code, assuming is_early was pseudo-code)
-    let is_early = false; // Add logic here if needed to determine early cancellation based on start_time
     if is_early {
         // The creator is entitled to compensation equal to the full minimum-lock
         // period even though the subscriber is cancelling early.  This prevents
@@ -869,6 +1043,7 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
                     token_client.transfer(&env.current_contract_address(), &creator, &payout);
                 }
             }
+            sub.balance -= penalty_nano.min(available_nano);
         }
     }
 
@@ -1036,3 +1211,5 @@ mod test;
 mod test_tiny_streams;
 #[cfg(test)]
 mod test_withdrawal_consistency;
+#[cfg(test)]
+mod test_dao_treasury;

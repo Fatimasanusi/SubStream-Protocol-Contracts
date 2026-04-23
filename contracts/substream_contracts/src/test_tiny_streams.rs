@@ -35,7 +35,7 @@ fn test_tiny_stream_rounding() {
     let rate = 500_000_000; 
     
     // Subscribe with 1000 units
-    client.subscribe(&subscriber, &creator, &token.address, &1000, &rate);
+    client.subscribe(&subscriber, &creator, &token.address, &1000, &rate, &None);
 
     let week = 7 * 24 * 60 * 60;
     env.ledger().set_timestamp(start + week + 100);
@@ -50,7 +50,7 @@ fn test_tiny_stream_rounding() {
     let tiny_rate = 16534; 
     let subscriber2 = Address::generate(&env);
     token_admin.mint(&subscriber2, &1_000_000_000);
-    client.subscribe(&subscriber2, &creator, &token.address, &1000, &tiny_rate);
+    client.subscribe(&subscriber2, &creator, &token.address, &1000, &tiny_rate, &None);
     
     env.ledger().set_timestamp(start + week + week + week + 100); 
     client.collect(&subscriber2, &creator);

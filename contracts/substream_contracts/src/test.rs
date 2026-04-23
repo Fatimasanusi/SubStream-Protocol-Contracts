@@ -41,7 +41,7 @@ fn test_is_subscribed_active() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &1000, &1_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &1000, &1_000_000_000, &None);
 
     env.ledger().set_timestamp(105);
     assert!(client.is_subscribed(&subscriber, &creator));
@@ -64,7 +64,7 @@ fn test_is_subscribed_expired() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &10, &10_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &10, &10_000_000_000, &None);
 
     env.ledger().set_timestamp(100 + WEEK + 2);
     assert!(!client.is_subscribed(&subscriber, &creator));
@@ -91,7 +91,7 @@ fn test_balance_depletion_auto_close_at_zero() {
     // Exhausts after 10 paid seconds (post-7-day trial).
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &10_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &10_000_000_000, &None);
 
     // One second before balance reaches zero: still subscribed
     env.ledger().set_timestamp(start + WEEK + 9);
@@ -147,7 +147,7 @@ fn test_free_trial_ignores_claims_within_first_week() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000, &None);
 
     env.ledger().set_timestamp(start + WEEK - 1);
     client.collect(&subscriber, &creator);
@@ -176,7 +176,7 @@ fn test_free_to_paid_transition_event_emitted_once() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &300, &1);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &1, &None);
 
     env.ledger().set_timestamp(start + WEEK + 1);
     client.collect(&subscriber, &creator);
@@ -213,7 +213,7 @@ fn test_cancel_before_minimum_duration_applies_penalty() {
 
     let rate: i128 = 1_000_000_000; // 1 token/second
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &rate);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &rate, &None);
 
     // Cancel after only 1 hour — still inside the 24-hour lock window.
     env.ledger().set_timestamp(100 + 3600);
@@ -247,7 +247,7 @@ fn test_cancel_after_minimum_duration() {
 
     let start = 100u64;
     env.ledger().set_timestamp(start);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000, &None);
 
     env.ledger().set_timestamp(start + DAY + 10);
     client.cancel(&subscriber, &creator);
@@ -273,7 +273,7 @@ fn test_cancel_exactly_at_minimum_duration() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(100);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000, &None);
 
     env.ledger().set_timestamp(100 + DAY);
     client.cancel(&subscriber, &creator);
@@ -304,7 +304,7 @@ fn test_top_up() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     env.ledger().set_timestamp(0);
-    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1_000_000_000, &None);
     assert_eq!(token.balance(&contract_id), 100);
 
     client.top_up(&subscriber, &creator, &50);
@@ -610,7 +610,7 @@ fn test_flash_stream_attack_within_single_ledger() {
     env.ledger().set_timestamp(ledger_time);
 
     // Attacker deposits 10 tokens.
-    client.subscribe(&attacker, &creator, &token.address, &10, &1_000_000_000);
+    client.subscribe(&attacker, &creator, &token.address, &10, &1_000_000_000, &None);
     assert!(client.is_subscribed(&attacker, &creator));
 
     // Attempt to cancel within the same ledger (0 seconds elapsed).
@@ -657,7 +657,7 @@ fn test_flash_stream_attack_multiple_quick_subscriptions() {
         token_admin.mint(&subscriber, &5); // fund each new attacker address
 
         // Subscribe with minimal amount
-        client.subscribe(&subscriber, &creator, &token.address, &5, &1_000_000_000);
+        client.subscribe(&subscriber, &creator, &token.address, &5, &1_000_000_000, &None);
         
         // Verify subscription is active
         assert!(client.is_subscribed(&subscriber, &creator));
@@ -689,7 +689,7 @@ fn test_flash_stream_attack_grace_period_exploitation() {
     env.ledger().set_timestamp(start_time);
 
     // Subscribe with very small amount that will be exhausted quickly
-    client.subscribe(&attacker, &creator, &token.address, &10, &100_000_000_000);
+    client.subscribe(&attacker, &creator, &token.address, &10, &100_000_000_000, &None);
 
     // Fast forward to exhaust funds but stay within grace period
     let exhaust_time = start_time + 10; // 10 seconds later
@@ -707,7 +707,7 @@ fn test_flash_stream_attack_grace_period_exploitation() {
     
     env.ledger().set_timestamp(exhaust_time + 1); // 1 second later
     
-    client.subscribe(&new_attacker, &creator, &token.address, &5, &1_000_000_000);
+    client.subscribe(&new_attacker, &creator, &token.address, &5, &1_000_000_000, &None);
     
     // Both subscriptions should be active (original in grace period, new one active)
     assert!(client.is_subscribed(&attacker, &creator));
@@ -743,7 +743,7 @@ fn test_blacklist_user_prevents_subscription() {
 
     // Attempt to subscribe should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.subscribe(&malicious_user, &creator, &token.address, &100, &1_000_000_000);
+        client.subscribe(&malicious_user, &creator, &token.address, &100, &1_000_000_000, &None);
     }));
 
     assert!(result.is_err());
@@ -775,7 +775,7 @@ fn test_unblacklist_user_allows_subscription() {
     assert!(!client.is_user_blacklisted(&creator, &user));
 
     // Now subscription should work
-    client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000);
+    client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000, &None);
     assert!(client.is_subscribed(&user, &creator));
 }
 
@@ -892,12 +892,12 @@ fn test_blacklist_only_affects_specific_creator() {
 
     // Subscription to creator_1 should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.subscribe(&user, &creator_1, &token.address, &100, &1_000_000_000);
+        client.subscribe(&user, &creator_1, &token.address, &100, &1_000_000_000, &None);
     }));
     assert!(result.is_err());
 
     // Subscription to creator_2 should succeed
-    client.subscribe(&user, &creator_2, &token.address, &100, &1_000_000_000);
+    client.subscribe(&user, &creator_2, &token.address, &100, &1_000_000_000, &None);
     assert!(client.is_subscribed(&user, &creator_2));
 }
 
@@ -919,7 +919,7 @@ fn test_blacklist_with_existing_subscription() {
     let client = SubStreamContractClient::new(&env, &contract_id);
 
     // User subscribes first
-    client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000);
+    client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000, &None);
     assert!(client.is_subscribed(&user, &creator));
 
     // Creator then blacklists the user
@@ -933,7 +933,7 @@ fn test_blacklist_with_existing_subscription() {
     client.cancel(&user, &creator);
     
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000);
+        client.subscribe(&user, &creator, &token.address, &100, &1_000_000_000, &None);
     }));
     assert!(result.is_err());
 }
@@ -961,7 +961,7 @@ fn test_creator_stats_track_direct_stream_lifecycle() {
     // rate 3 tokens/s = 3 * PRECISION_MULTIPLIER; 10 s post-trial → 30 tokens earned
     env.ledger().set_timestamp(100);
     // rate = 3 tokens/second = 3 × PRECISION_MULTIPLIER nano-units/second.
-    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &3_000_000_000, &None);
 
     assert_eq!(
         client.creator_stats(&creator),
@@ -1031,7 +1031,7 @@ fn test_creator_stats_do_not_double_count_same_fan_across_streams() {
     let percentages = vec![&env, 20u32, 20u32, 20u32, 20u32, 20u32];
 
     env.ledger().set_timestamp(0);
-    client.subscribe(&fan, &creator, &token.address, &200, &1);
+    client.subscribe(&fan, &creator, &token.address, &200, &1, &None);
     client.subscribe_group(&fan, &channel_id, &token.address, &500, &1, &creators, &percentages);
 
     assert_eq!(
@@ -1088,7 +1088,7 @@ fn test_creator_stats_scale_with_cached_counters() {
     for _ in 0..FAN_COUNT {
         let fan = Address::generate(&env);
         token_admin.mint(&fan, &100);
-        client.subscribe(&fan, &creator, &token.address, &100, &1);
+        client.subscribe(&fan, &creator, &token.address, &100, &1, &None);
     }
 
     let stats = client.creator_stats(&creator);
@@ -1124,7 +1124,7 @@ fn test_early_cancel_partial_refund_when_balance_exceeds_penalty() {
     let rate: i128 = 1_000_000_000;
     let deposit: i128 = 200_000;
     env.ledger().set_timestamp(0);
-    client.subscribe(&subscriber, &creator, &token.address, &deposit, &rate);
+    client.subscribe(&subscriber, &creator, &token.address, &deposit, &rate, &None);
 
     // Cancel after 2 hours — well within the 24-hour window.
     env.ledger().set_timestamp(7200);
@@ -1160,7 +1160,7 @@ fn test_early_cancel_penalty_capped_at_balance() {
     // rate = 1 token/second → penalty = 86 400 tokens > deposit of 50.
     let deposit: i128 = 50;
     env.ledger().set_timestamp(0);
-    client.subscribe(&subscriber, &creator, &token.address, &deposit, &1_000_000_000);
+    client.subscribe(&subscriber, &creator, &token.address, &deposit, &1_000_000_000, &None);
 
     env.ledger().set_timestamp(1800); // 30 minutes
     client.cancel(&subscriber, &creator);
@@ -1190,7 +1190,7 @@ fn test_early_cancel_zero_rate_no_penalty() {
 
     env.ledger().set_timestamp(0);
     // rate = 0 → no charges, no penalty.
-    client.subscribe(&subscriber, &creator, &token.address, &100, &0);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &0, &None);
 
     env.ledger().set_timestamp(3600);
     client.cancel(&subscriber, &creator);
