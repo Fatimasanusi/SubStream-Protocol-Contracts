@@ -99,6 +99,8 @@ pub enum DataKey {
     DAOProposal(u64),                 // DAO proposal for merchant approval
     DAOVote(Address, u64),           // DAO member vote on proposal
     BlacklistedMerchant(Address),     // Blacklisted merchant status
+    // --- Global Reentrancy Guard Keys ---
+    ReentrancyGuard,                 // Global reentrancy protection state
 }
 
 #[contracttype]
@@ -469,6 +471,15 @@ pub struct DAOVoteCast {
     #[topic] pub proposal_id: u64,
     #[topic] pub vote: bool,
     pub voted_at: u64,
+}
+
+// --- Global Reentrancy Guard Events ---
+
+#[contractevent]
+pub struct ReentrancyAttemptDetected {
+    #[topic] pub caller: Address,
+    #[topic] pub protected_function: soroban_sdk::String,
+    pub detected_at: u64,
 }
 
 #[contract]
@@ -2185,6 +2196,66 @@ fn execute_merchant_proposal(env: &Env, proposal_id: u64) {
     }.publish(env);
 }
 
+// --- Global Reentrancy Guard Helper Functions ---
+
+/// RAII-style reentrancy guard using temporary storage
+/// Automatically resets on drop (function exit) for both success and failure paths
+pub struct ReentrancyGuard<'env> {
+    env: &'env Env,
+    active: bool,
+}
+
+impl<'env> ReentrancyGuard<'env> {
+    /// Creates a new reentrancy guard
+    /// Panics if reentrancy is detected
+    pub fn new(env: &'env Env, function_name: &str) -> Self {
+        // Check if reentrancy guard is already active
+        if let Some(guard_active) = env.storage().temporary().get::<_, bool>(&DataKey::ReentrancyGuard) {
+            if guard_active {
+                // Emit event for monitoring
+                ReentrancyAttemptDetected {
+                    caller: env.current_contract_address(),
+                    protected_function: soroban_sdk::String::from_str(env, function_name),
+                    detected_at: env.ledger().timestamp(),
+                }
+                .publish(env);
+                
+                panic!("reentrancy detected in {}", function_name);
+            }
+        }
+        
+        // Set the guard to active
+        env.storage().temporary().set(&DataKey::ReentrancyGuard, &true);
+        
+        Self {
+            env,
+            active: true,
+        }
+    }
+}
+
+impl<'env> Drop for ReentrancyGuard<'env> {
+    fn drop(&mut self) {
+        if self.active {
+            // Reset the guard when the guard goes out of scope
+            self.env.storage().temporary().remove(&DataKey::ReentrancyGuard);
+        }
+    }
+}
+
+/// Macro to create a reentrancy guard for a function
+/// Usage: `let _guard = reentrancy_guard!(env, "function_name");`
+macro_rules! reentrancy_guard {
+    ($env:expr, $function_name:expr) => {
+        let _guard = ReentrancyGuard::new($env, $function_name);
+    };
+}
+
+/// Check if reentrancy guard is currently active (for testing purposes)
+pub fn is_reentrancy_guard_active(env: &Env) -> bool {
+    env.storage().temporary().get(&DataKey::ReentrancyGuard).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod test;
 #[cfg(test)]
@@ -2197,3 +2268,5 @@ mod test_enhanced_subscriptions;
 mod test_merchant_registry;
 #[cfg(test)]
 mod test_formal_verification;
+#[cfg(test)]
+mod test_reentrancy_guard;
