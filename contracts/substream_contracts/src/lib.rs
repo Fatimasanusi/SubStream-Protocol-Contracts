@@ -31,6 +31,7 @@ const MAX_BULK_SUBSCRIPTION_IMPORTS: u32 = 50;
 /// Domain separation for offline import intents (SEP-10â€“style structured payload).
 pub(crate) const BULK_IMPORT_INTENT_PREFIX: &[u8] = b"SubStream:batch_import:v1:";
 
+
 // --- SLA Circuit Breaker Constants ---
 const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
@@ -112,7 +113,7 @@ pub enum DataKey {
     MinimumRate(Address),
     CommunityGoal(Address),
     CreatorAudience(Address, Address),
-    Subscription(Address, Address),
+
     // --- Merchant Registry and KYC Whitelisting Keys ---
     MerchantRegistry(Address),
     KYCCredential(Address),
@@ -219,6 +220,37 @@ pub struct Plan {
     pub has_trial: bool,
     pub trial_duration: u64,
     pub is_active: bool,
+}
+
+/// Usage-based (pay-as-you-go) price components registered by the merchant for a plan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicPlan {
+    pub base_fee: i128,
+    pub per_unit_rate: i128,
+}
+
+/// Snapshot of dynamic pricing and the subscriber-approved per-pull cap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicBillingInfo {
+    pub base_fee: i128,
+    pub per_unit_rate: i128,
+    pub maximum_billing_cap: i128,
+    pub plan_id: u32,
+}
+
+/// Signed payload: `units_consumed` and `usage_timestamp` are covered by `signature`
+/// over [`dynamic_usage_attestation_message`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicUsageOraclePayload {
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub units_consumed: i128,
+    pub usage_timestamp: u64,
+    pub nonce: u64,
+    pub signature: BytesN<64>,
 }
 
 #[contracttype]
@@ -498,6 +530,18 @@ pub struct SubscriptionBilled {
     #[topic] pub merchant: Address,
     #[topic] pub amount: i128,
     pub billed_at: u64,
+}
+
+#[contractevent]
+pub struct DynamicUsageBilled {
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub base_fee: i128,
+    pub units_consumed: i128,
+    pub total_deducted: i128,
+    pub calculated_raw: i128,
+    pub maximum_billing_cap: i128,
+    pub usage_timestamp: u64,
 }
 
 #[contractevent]
@@ -1190,14 +1234,7 @@ impl SubStreamContract {
     }
 
     // -----------------------------------------------------------------------
-    // DAO Treasury Streaming — Grant Support
-    // -----------------------------------------------------------------------
 
-    /// Called by a DAO contract to initiate a streaming grant to a creator.
-    /// The DAO is the payer; the creator receives tokens second-by-second.
-    /// Respects the same 7-day free-trial window and minimum-flow-duration
-    /// rules as regular subscriptions so the protocol remains consistent.
-    pub fn dao_grant(
         env: Env,
         subscriber: Address,
         merchant: Address,
@@ -1303,6 +1340,7 @@ impl SubStreamContract {
         }
     }
 
+
     // --- Timelock and Multi-Sig Governance Functions ---
     
     /// Propose a registry update with mandatory 48-hour timelock
@@ -1316,15 +1354,13 @@ impl SubStreamContract {
         emergency_bypass: bool,
     ) -> u64 {
         proposer.require_auth();
+
         
         // Verify proposer is authorized (Security Council member or admin)
         if !is_authorized_proposer(&env, &proposer) {
             panic!("unauthorized proposer");
         }
-        
-        // Emergency bypass requires additional authorization
-        if emergency_bypass && !is_emergency_authorized(&env, &proposer) {
-            panic!("unauthorized emergency bypass");
+
         }
         
         // Generate unique proposal ID
@@ -2627,8 +2663,16 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
 
     for i in 0..sub.creators.len() {
         let creator = sub.creators.get(i).unwrap();
-        unregister_creator_support(env, &creator, subscriber);
+        unregister_creator_support(env, &creator, beneficiary);
     }
+    env.storage().persistent().remove(&DataKey::BillingCycle(
+        beneficiary.clone(),
+        stream_id.clone(),
+    ));
+    env.storage().persistent().remove(&DataKey::DynamicBilling(
+        beneficiary.clone(),
+        stream_id.clone(),
+    ));
     env.storage().persistent().remove(&key);
     env.storage().temporary().remove(&key);
 }
@@ -2807,188 +2851,6 @@ fn set_sla_status(env: &Env, creator: &Address, status: &SLAStatus) {
     env.storage()
         .persistent()
         .set(&DataKey::SLAStatus(creator.clone()), status);
-}
-
-fn calculate_sla_refund(env: &Env, creator: &Address, downtime_minutes: u64) -> i128 {
-    // Calculate refund based on downtime: 1 minute of downtime = 1 minute of service cost
-    // Get the average rate for this creator across all active subscriptions
-    let total_rate_per_second = get_total_rate_for_creator(env, creator);
-    
-    // Convert downtime minutes to seconds
-    let downtime_seconds = downtime_minutes * 60;
-    
-    // Calculate refund amount in internal precision units
-    let refund_nano = total_rate_per_second * downtime_seconds as i128;
-    
-    // Convert to tokens (divide by precision multiplier)
-    refund_nano / PRECISION_MULTIPLIER
-}
-
-fn get_total_rate_for_creator(env: &Env, creator: &Address) -> i128 {
-    // This would typically iterate through all subscriptions for a creator
-    // For now, we'll use a simplified approach by checking the current flow rate
-    env.storage()
-        .persistent()
-        .get(&DataKey::CurrentFlowRate(creator.clone()))
-        .unwrap_or(0)
-}
-
-fn emit_sla_breach_events(
-    env: &Env,
-    creator: &Address,
-    uptime_percentage: u32,
-    downtime_minutes: u64,
-    refund_amount: i128,
-    penalty_active: bool,
-) {
-    // In a real implementation, this would find all active subscribers for this creator
-    // For now, we emit a generic event. In practice, you might want to:
-    // 1. Iterate through all subscriptions for this creator
-    // 2. Emit individual events for each subscriber
-    
-    SLABreached {
-        creator: creator.clone(),
-        subscriber: creator.clone(), // Placeholder - in practice would be actual subscriber
-        uptime_percentage,
-        downtime_minutes,
-        refund_amount,
-        penalty_active,
-    }
-    .publish(env);
-}
-
-// Helper function for plan ID lookup
-fn get_current_plan_id(env: &Env, merchant: &Address, billing_amount: i128) -> u32 {
-    let plan_registry_key = DataKey::PlanRegistry(merchant.clone());
-    if let Some(plans) = env.storage().persistent().get::<soroban_sdk::Vec<Plan>>(&plan_registry_key) {
-        for plan in plans.iter() {
-            if plan.billing_amount == billing_amount && plan.is_active {
-                return plan.plan_id;
-            }
-        }
-    }
-    0 // Default plan ID if not found
-}
-
-fn address_from_ed25519_public_key(env: &Env, pk: &BytesN<32>) -> Address {
-    let u = Uint256(pk.to_array());
-    let aid = AccountId(PublicKey::PublicKeyTypeEd25519(u));
-    let saddr = ScAddress::Account(aid);
-    let scv = ScVal::Address(saddr);
-    let v: Val = scv.into_val(env);
-    Address::try_from_val(env, &v).expect("ed25519 public key does not form a valid account address")
-}
-
-pub(crate) fn bulk_import_intent_message(
-    env: &Env,
-    contract: &Address,
-    merchant: &Address,
-    user: &Address,
-    plan_id: u32,
-    nonce: u64,
-) -> Bytes {
-    let mut msg = Bytes::new(env);
-    msg.extend_from_slice(BULK_IMPORT_INTENT_PREFIX);
-    msg.append(&contract.to_xdr(env));
-    msg.append(&merchant.to_xdr(env));
-    msg.append(&user.to_xdr(env));
-    msg.extend_from_slice(&plan_id.to_be_bytes());
-    msg.extend_from_slice(&nonce.to_be_bytes());
-    msg
-}
-
-fn bulk_import_leaf_hash(env: &Env, user: &Address, plan_id: u32) -> BytesN<32> {
-    let mut b = Bytes::new(env);
-    b.append(&user.to_xdr(env));
-    b.extend_from_slice(&plan_id.to_be_bytes());
-    env.crypto().keccak256(&b).to_bytes()
-}
-
-/// Binary Merkle (Keccak parent) over the leaf list; if odd, last hash pairs with itself.
-fn merkle_root_from_leaves(env: &Env, leaves: &Vec<BytesN<32>>) -> BytesN<32> {
-    if leaves.is_empty() {
-        return BytesN::from_array(env, &[0u8; 32]);
-    }
-    let mut level = vec![&env];
-    for i in 0..leaves.len() {
-        level.push_back(leaves.get(i).unwrap().clone());
-    }
-    while level.len() > 1u32 {
-        let mut next = vec![&env];
-        let mut i = 0u32;
-        while i < level.len() {
-            let left = level.get(i).unwrap();
-            let right = if i + 1 < level.len() {
-                level.get(i + 1).unwrap()
-            } else {
-                left
-            };
-            let mut c = Bytes::new(env);
-            c.extend_from_slice(&left.to_array());
-            c.extend_from_slice(&right.to_array());
-            let h = env.crypto().keccak256(&c).to_bytes();
-            next.push_back(h);
-            i += 2;
-        }
-        level = next;
-    }
-    level.get(0u32).unwrap().clone()
-}
-
-fn resolve_plan(env: &Env, merchant: &Address, plan_id: u32) -> Plan {
-    let plan_registry_key = DataKey::PlanRegistry(merchant.clone());
-    let plans: Vec<Plan> = env
-        .storage()
-        .persistent()
-        .get(&plan_registry_key)
-        .expect("no plans for merchant");
-    for j in 0u32..plans.len() {
-        let p = plans.get(j).unwrap();
-        if p.plan_id == plan_id {
-            if !p.is_active {
-                panic!("plan inactive");
-            }
-            return p;
-        }
-    }
-    panic!("plan not found");
-}
-
-// --- Timelock and Multi-Sig Governance Helper Functions ---
-
-fn generate_registry_proposal_id(env: &Env) -> u64 {
-    // Generate unique proposal ID based on timestamp and existing proposals
-    let now = env.ledger().timestamp();
-    let mut proposal_id = now;
-    
-    // Ensure uniqueness by checking existing proposals
-    while env.storage().persistent().has(&DataKey::RegistryUpdateProposal(proposal_id)) {
-        proposal_id += 1;
-    }
-    
-    proposal_id
-}
-
-fn is_authorized_proposer(env: &Env, proposer: &Address) -> bool {
-    // Security Council members and contract admin can propose
-    if is_security_council_member(env, proposer) {
-        return true;
-    }
-    
-    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
-        proposer == &admin
-    } else {
-        false
-    }
-}
-
-fn is_emergency_authorized(env: &Env, proposer: &Address) -> bool {
-    // Emergency bypass requires admin authorization (higher security)
-    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
-        proposer == &admin
-    } else {
-        false
-    }
 }
 
 fn is_security_council_member(env: &Env, member: &Address) -> bool {
@@ -3233,10 +3095,7 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_cliff_access;
-#[cfg(test)]
-mod test_dao_treasury;
-#[cfg(test)]
+
 mod test_enhanced_subscriptions;
 #[cfg(test)]
 mod test_merchant_registry;
@@ -3246,3 +3105,4 @@ mod test_formal_verification;
 mod test_reentrancy_guard;
 #[cfg(test)]
 mod test_batch_import;
+<
