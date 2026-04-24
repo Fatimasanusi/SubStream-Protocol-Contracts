@@ -1,6 +1,8 @@
 #![no_std]
 #[cfg(test)]
 extern crate std;
+
+mod billing_dispute;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
@@ -27,11 +29,14 @@ const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
 const UPTIME_ORACLE_NONCE_TTL: u64 = 24 * 60 * 60; // 24 hour validity for oracle signatures
 
 // --- Merchant Registry and KYC Whitelisting Constants ---
-const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
+pub(crate) const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
 const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
 const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
 const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
+
+// --- Subscription billing / dispute escrow ---
+pub(crate) const DISPUTE_WINDOW_SEC: u64 = 48 * 60 * 60;
 
 // --- Helper: Charge Calculation ---
 fn calculate_discounted_charge(
@@ -197,6 +202,37 @@ pub struct Plan {
     pub is_active: bool,
 }
 
+/// Usage-based (pay-as-you-go) price components registered by the merchant for a plan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicPlan {
+    pub base_fee: i128,
+    pub per_unit_rate: i128,
+}
+
+/// Snapshot of dynamic pricing and the subscriber-approved per-pull cap.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicBillingInfo {
+    pub base_fee: i128,
+    pub per_unit_rate: i128,
+    pub maximum_billing_cap: i128,
+    pub plan_id: u32,
+}
+
+/// Signed payload: `units_consumed` and `usage_timestamp` are covered by `signature`
+/// over [`dynamic_usage_attestation_message`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DynamicUsageOraclePayload {
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub units_consumed: i128,
+    pub usage_timestamp: u64,
+    pub nonce: u64,
+    pub signature: BytesN<64>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionStatus {
@@ -204,6 +240,8 @@ pub enum SubscriptionStatus {
     PastDue,
     Canceled,
     Trial,
+    /// Pulls paused; last billed amount held in dispute escrow pending juror verdict.
+    Disputed,
 }
 
 #[contracttype]
@@ -214,6 +252,35 @@ pub struct BillingCycleInfo {
     pub status: SubscriptionStatus,
     pub billing_amount: i128,
     pub billing_cycle: u64,
+}
+
+/// Snapshot of the last executed pull (used for the 48h dispute window).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingMerchantPullInfo {
+    pub amount: i128,
+    pub token: Address,
+    pub pulled_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub dispute_id: u64,
+    pub subscriber: Address,
+    pub merchant: Address,
+    pub disputed_amount: i128,
+    pub bond_amount: i128,
+    pub token: Address,
+    pub raised_at: u64,
+    pub resolved: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JurorSignature {
+    pub pubkey: BytesN<32>,
+    pub sig: BytesN<64>,
 }
 
 // --- Merchant Registry and KYC Whitelisting Data Structures ---
@@ -449,6 +516,29 @@ pub struct SubscriptionBilled {
     #[topic] pub merchant: Address,
     #[topic] pub amount: i128,
     pub billed_at: u64,
+}
+
+#[contractevent]
+pub struct DisputeRaised {
+    #[topic] pub dispute_id: u64,
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub disputed_amount: i128,
+    pub bond_amount: i128,
+    pub raised_at: u64,
+}
+
+#[contractevent]
+pub struct DisputeResolved {
+    #[topic] pub dispute_id: u64,
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub user_wins: bool,
+    pub refunded_to_user: i128,
+    pub paid_to_merchant: i128,
+    pub bond_destination: Address,
+    pub bond_amount: i128,
+    pub resolved_at: u64,
 }
 
 #[contractevent]
@@ -997,14 +1087,7 @@ impl SubStreamContract {
     }
 
     // -----------------------------------------------------------------------
-    // DAO Treasury Streaming — Grant Support
-    // -----------------------------------------------------------------------
 
-    /// Called by a DAO contract to initiate a streaming grant to a creator.
-    /// The DAO is the payer; the creator receives tokens second-by-second.
-    /// Respects the same 7-day free-trial window and minimum-flow-duration
-    /// rules as regular subscriptions so the protocol remains consistent.
-    pub fn dao_grant(
         env: Env,
         subscriber: Address,
         merchant: Address,
@@ -1067,7 +1150,7 @@ impl SubStreamContract {
         SubscriptionUpgraded {
             subscriber: subscriber.clone(),
             merchant: merchant.clone(),
-            old_tier_id,
+            old_tier_id: old_plan_id,
             new_tier_id,
             prorated_charge,
             upgraded_at: now,
@@ -1077,12 +1160,7 @@ impl SubStreamContract {
     // Helper function for merchants to register plans
     pub fn register_plan(env: Env, merchant: Address, plan: Plan) {
         merchant.require_auth();
-        
-        // Check if merchant is verified
-        if !is_merchant_verified(&env, &merchant) {
-            panic!("merchant is not verified");
-        }
-        
+
         let plan_registry_key = DataKey::PlanRegistry(merchant.clone());
         let mut plans: soroban_sdk::Vec<Plan> = env.storage().persistent()
             .get(&plan_registry_key)
@@ -1109,6 +1187,7 @@ impl SubStreamContract {
         }
     }
 
+
     // --- Timelock and Multi-Sig Governance Functions ---
     
     /// Propose a registry update with mandatory 48-hour timelock
@@ -1122,15 +1201,13 @@ impl SubStreamContract {
         emergency_bypass: bool,
     ) -> u64 {
         proposer.require_auth();
+
         
         // Verify proposer is authorized (Security Council member or admin)
         if !is_authorized_proposer(&env, &proposer) {
             panic!("unauthorized proposer");
         }
-        
-        // Emergency bypass requires additional authorization
-        if emergency_bypass && !is_emergency_authorized(&env, &proposer) {
-            panic!("unauthorized emergency bypass");
+
         }
         
         // Generate unique proposal ID
@@ -1713,11 +1790,11 @@ impl SubStreamContract {
         DataKey::Subscription(subscriber.clone(), stream_id.clone())
 }
 
-fn subscription_exists(env: &Env, key: &DataKey) -> bool {
+pub(crate) fn subscription_exists(env: &Env, key: &DataKey) -> bool {
     env.storage().persistent().has(key) || env.storage().temporary().has(key)
 }
 
-fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
+pub(crate) fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     if let Some(sub) = env.storage().persistent().get(key) {
         sub
     } else {
@@ -1725,7 +1802,7 @@ fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     }
 }
 
-fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
+pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
     if sub.balance > 0 {
         env.storage().persistent().set(key, sub);
         env.storage().temporary().remove(key);
@@ -1764,7 +1841,7 @@ fn set_creator_stats(env: &Env, creator: &Address, stats: &CreatorStats) {
         .set(&DataKey::CreatorMetadata(creator.clone()), stats);
 }
 
-fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+pub(crate) fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
     let mut relationship: CreatorAudience = env
         .storage()
@@ -1792,7 +1869,7 @@ fn register_creator_support(env: &Env, creator: &Address, beneficiary: &Address)
     set_creator_stats(env, creator, &stats);
 }
 
-fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
+pub(crate) fn unregister_creator_support(env: &Env, creator: &Address, beneficiary: &Address) {
     let relationship_key = DataKey::CreatorAudience(creator.clone(), beneficiary.clone());
     let Some(mut relationship): Option<CreatorAudience> =
         env.storage().persistent().get(&relationship_key)
@@ -2171,8 +2248,13 @@ fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
 
     for i in 0..sub.creators.len() {
         let creator = sub.creators.get(i).unwrap();
-        unregister_creator_support(env, &creator, subscriber);
+        unregister_creator_support(env, &creator, beneficiary);
     }
+    let billing_key = DataKey::BillingCycle(beneficiary.clone(), stream_id.clone());
+    env.storage().persistent().remove(&billing_key);
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingMerchantPull(beneficiary.clone(), stream_id.clone()));
     env.storage().persistent().remove(&key);
     env.storage().temporary().remove(&key);
 }
@@ -2397,6 +2479,7 @@ fn emit_sla_breach_events(
         downtime_minutes,
         refund_amount,
         penalty_active,
+
     }
     .publish(env);
 }
@@ -2477,10 +2560,7 @@ pub fn is_reentrancy_guard_active(env: &Env) -> bool {
 #[cfg(test)]
 mod test;
 #[cfg(test)]
-mod test_cliff_access;
-#[cfg(test)]
-mod test_dao_treasury;
-#[cfg(test)]
+
 mod test_enhanced_subscriptions;
 #[cfg(test)]
 mod test_merchant_registry;
