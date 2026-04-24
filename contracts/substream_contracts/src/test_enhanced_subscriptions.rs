@@ -77,7 +77,8 @@ fn test_execute_subscription_pull_success() {
     env.ledger().set_timestamp(1000);
     client.initialize_subscription(&subscriber, &merchant, &1, &token.address(), &None);
 
-    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
+    // Set up allowance
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
 
     env.ledger().set_timestamp(1000 + MONTH);
 
@@ -197,8 +198,8 @@ fn test_trial_period_auto_conversion() {
         SubscriptionStatus::Trial
     );
 
-    let token_admin = token::StellarAssetClient::new(&env, &token.address());
-    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
+    // Set up allowance for after trial
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
 
     env.ledger().set_timestamp(1000 + 7 * DAY + 1);
 
@@ -297,10 +298,11 @@ fn test_grace_period_entry_and_recovery() {
         matches!(e.topic_0, Some(topic) if topic == Symbol::from_str(&env, "PaymentFailedGracePeriodStarted"))
     }));
 
-    let token_admin = token::StellarAssetClient::new(&env, &token.address());
-    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
-
-    client.execute_subscription_pull(&merchant, &subscriber, &0i128, &None);
+    // Now provide allowance and recover
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
+    
+    // Should succeed within grace period
+    client.execute_subscription_pull(&merchant, &subscriber);
 
     assert_eq!(
         client.get_subscription_status(&subscriber, &merchant),
@@ -503,7 +505,8 @@ fn test_full_subscription_lifecycle() {
         SubscriptionStatus::Trial
     );
 
-    approve_for_contract(&env, &token_admin, &subscriber, &contract_id, 1000);
+    // Set up allowance for post-trial billing
+    token.approve(&subscriber, &contract_id, &1000, &1_000_000u32);
 
     env.ledger().set_timestamp(1000 + 7 * DAY + 1);
     client.upgrade_subscription_tier(&subscriber, &merchant, &2);
