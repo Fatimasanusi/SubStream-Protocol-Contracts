@@ -8,6 +8,7 @@ test: build
 build:
 	stellar contract build
 	@ls -l target/wasm32v1-none/release/*.wasm
+	@../../scripts/check_wasm_size.sh target/wasm32v1-none/release
 
 build-compressed: build
 	@echo "Compressing WASM files..."
