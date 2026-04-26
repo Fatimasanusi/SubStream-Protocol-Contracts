@@ -117,6 +117,43 @@ pub enum DataKey {
     CancelVelocityHourlyBuckets,
     CancelVelocityDailyBuckets,
     CancelVelocityBreakerState,
+    // --- Billing / dispute ---
+    BillingCycle(Address, Address),        // (subscriber, merchant)
+    PlanRegistry(Address),                 // (merchant)
+    PendingMerchantPull(Address, Address), // (subscriber, merchant)
+    TrialUsed(Address, Address),           // (subscriber, merchant)
+    ActiveDispute(Address, Address),       // (subscriber, merchant)
+    DisputeRecord(u64),                    // (dispute_id)
+    DisputeJurorKeys,
+    NextDisputeId,
+    // --- Merchant registry ---
+    MerchantRegistry(Address),
+    KYCCredential(Address),
+    BlacklistedMerchant(Address),
+    BlacklistedUser(Address, Address),     // (creator, user)
+    DAOProposal(u64),
+    DAOVote(Address, u64),                 // (voter, proposal_id)
+    RegistryUpdateProposal(u64),
+    SecurityCouncilMember(Address),
+    SecurityCouncilVeto(Address, u64),     // (council_member, proposal_id)
+    // --- Merchant reference ID for webhook payloads (issue #130) ---
+    MerchantReferenceId(Address, Address), // (subscriber, merchant)
+    // --- Misc persistent ---
+    MinimumRate(Address),
+    CommunityGoal(Address),
+    MerchantMetrics(Address),
+    MerchantToS(Address),
+    MerchantToSVersion(Address),
+    SubscriptionToSSnapshot(Address, Address), // (subscriber, merchant)
+    BuybackConfig,
+    BuybackNonce(u64),
+    ReentrancyGuard,
+    FamilyVault(Address),
+    VaultDelegate(Address, Address),       // (vault_id, delegate)
+    VaultSubscription(Address, Address),   // (vault_id, merchant)
+    AffiliateConfig(Address),
+    AffiliateReferral(Address, Address),   // (merchant, affiliate)
+    MerchantVacationMode(Address),
 }
 
 #[contracttype]
@@ -811,6 +848,10 @@ pub struct SubscriptionBilled {
     #[topic] pub merchant: Address,
     #[topic] pub amount: i128,
     pub billed_at: u64,
+    /// Web2 reference ID set by the merchant to link on-chain pubkey to off-chain user account.
+    pub merchant_reference_id: soroban_sdk::String,
+    /// Cryptographic receipt hash: sha256(merchant_id || subscriber_id || amount || billed_at || cycle_number).
+    pub receipt_hash: BytesN<32>,
 }
 
 #[contractevent]
@@ -842,6 +883,8 @@ pub struct TrialStarted {
     #[topic] pub merchant: Address,
     pub trial_duration: u64,
     pub started_at: u64,
+    /// Web2 reference ID set by the merchant.
+    pub merchant_reference_id: soroban_sdk::String,
 }
 
 #[contractevent]
@@ -857,6 +900,8 @@ pub struct PaymentFailedGracePeriodStarted {
     #[topic] pub merchant: Address,
     pub dunning_start_timestamp: u64,
     pub grace_period_end: u64,
+    /// Web2 reference ID set by the merchant.
+    pub merchant_reference_id: soroban_sdk::String,
 }
 
 #[contractevent]
@@ -867,6 +912,18 @@ pub struct SubscriptionUpgraded {
     pub new_tier_id: u32,
     pub prorated_charge: i128,
     pub upgraded_at: u64,
+}
+
+/// Issue #132: Cryptographic receipt for B2B accounting.
+/// receipt_hash = sha256(merchant_id || subscriber_id || amount || billed_at || cycle_number)
+#[contractevent]
+pub struct B2BReceiptIssued {
+    #[topic] pub subscriber: Address,
+    #[topic] pub merchant: Address,
+    pub receipt_hash: BytesN<32>,
+    pub amount: i128,
+    pub cycle_number: u64,
+    pub issued_at: u64,
 }
 
 // --- Merchant Registry and KYC Whitelisting Events ---
@@ -2606,6 +2663,38 @@ impl SubStreamContract {
     }
 
     // =========================================================================
+    // Issue #130: Merchant reference ID for webhook payloads
+    // =========================================================================
+
+    /// Store a Web2 reference ID that links a subscriber's on-chain pubkey to
+    /// an off-chain user account (e.g. a Stripe customer ID or internal UUID).
+    /// Only the merchant may set this for their own subscribers.
+    pub fn set_merchant_reference_id(
+        env: Env,
+        merchant: Address,
+        subscriber: Address,
+        reference_id: soroban_sdk::String,
+    ) {
+        merchant.require_auth();
+        env.storage().persistent().set(
+            &DataKey::MerchantReferenceId(subscriber, merchant),
+            &reference_id,
+        );
+    }
+
+    /// Retrieve the Web2 reference ID for a subscriber/merchant pair.
+    pub fn get_merchant_reference_id(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+    ) -> soroban_sdk::String {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantReferenceId(subscriber, merchant))
+            .unwrap_or_else(|| soroban_sdk::String::from_str(&env, ""))
+    }
+
+    // =========================================================================
     // Issue #126: Standardized event emissions for plan registration and
     // subscription lifecycle — complementary helpers
     // =========================================================================
@@ -3930,16 +4019,16 @@ fn default_velocity_circuit_breaker_state() -> VelocityCircuitBreakerState {
 
 fn read_hourly_cancel_buckets(env: &Env) -> soroban_sdk::Vec<HourlyCancelBucket> {
     env.storage()
-        .persistent()
+        .temporary()
         .get(&DataKey::CancelVelocityHourlyBuckets)
         .unwrap_or(default_hourly_cancel_buckets(env))
 }
 
 fn write_hourly_cancel_buckets(env: &Env, buckets: &soroban_sdk::Vec<HourlyCancelBucket>) {
     env.storage()
-        .persistent()
+        .temporary()
         .set(&DataKey::CancelVelocityHourlyBuckets, buckets);
-    env.storage().persistent().extend_ttl(
+    env.storage().temporary().extend_ttl(
         &DataKey::CancelVelocityHourlyBuckets,
         TTL_THRESHOLD,
         TTL_BUMP_AMOUNT,
@@ -3948,16 +4037,16 @@ fn write_hourly_cancel_buckets(env: &Env, buckets: &soroban_sdk::Vec<HourlyCance
 
 fn read_daily_cancel_buckets(env: &Env) -> soroban_sdk::Vec<DailyCancelBucket> {
     env.storage()
-        .persistent()
+        .temporary()
         .get(&DataKey::CancelVelocityDailyBuckets)
         .unwrap_or(default_daily_cancel_buckets(env))
 }
 
 fn write_daily_cancel_buckets(env: &Env, buckets: &soroban_sdk::Vec<DailyCancelBucket>) {
     env.storage()
-        .persistent()
+        .temporary()
         .set(&DataKey::CancelVelocityDailyBuckets, buckets);
-    env.storage().persistent().extend_ttl(
+    env.storage().temporary().extend_ttl(
         &DataKey::CancelVelocityDailyBuckets,
         TTL_THRESHOLD,
         TTL_BUMP_AMOUNT,
@@ -3966,16 +4055,16 @@ fn write_daily_cancel_buckets(env: &Env, buckets: &soroban_sdk::Vec<DailyCancelB
 
 fn read_velocity_circuit_breaker_state(env: &Env) -> VelocityCircuitBreakerState {
     env.storage()
-        .persistent()
+        .temporary()
         .get(&DataKey::CancelVelocityBreakerState)
         .unwrap_or(default_velocity_circuit_breaker_state())
 }
 
 fn write_velocity_circuit_breaker_state(env: &Env, state: &VelocityCircuitBreakerState) {
     env.storage()
-        .persistent()
+        .temporary()
         .set(&DataKey::CancelVelocityBreakerState, state);
-    env.storage().persistent().extend_ttl(
+    env.storage().temporary().extend_ttl(
         &DataKey::CancelVelocityBreakerState,
         TTL_THRESHOLD,
         TTL_BUMP_AMOUNT,
