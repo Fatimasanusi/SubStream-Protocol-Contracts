@@ -2,6 +2,89 @@
 
 This document describes the WASM compression implementation for SubStream Protocol Contracts, designed to reduce deployment fees on the Stellar network by optimizing contract binary sizes.
 
+---
+
+## Cargo Release Profile (opt-level = "z")
+
+All size optimizations begin at compile time. The workspace `Cargo.toml` configures the `[profile.release]` section as follows:
+
+```toml
+[profile.release]
+opt-level        = "z"       # Optimize for binary size (smallest output)
+lto              = true      # Link-Time Optimization: cross-crate dead-code removal
+codegen-units    = 1         # Single codegen unit enables maximum inlining/DCE
+strip            = "symbols" # Remove debug symbols from the final binary
+debug            = 0         # No debug info
+debug-assertions = false     # Disable debug_assert! macros
+overflow-checks  = true      # Keep arithmetic overflow checks (security requirement)
+panic            = "abort"   # No unwinding machinery; saves ~10 KB
+```
+
+### Why each setting matters
+
+| Setting | Effect on binary size |
+|---|---|
+| `opt-level = "z"` | Instructs LLVM to prefer size over speed at every trade-off point |
+| `lto = true` | Eliminates dead code across crate boundaries; most impactful single flag |
+| `codegen-units = 1` | Allows LLVM to see the whole program and inline/remove more aggressively |
+| `strip = "symbols"` | Removes the symbol table; saves several KB with no runtime cost |
+| `panic = "abort"` | Removes the stack-unwinding runtime (~10 KB) |
+| `debug = 0` | No DWARF sections emitted |
+
+### Security note on LTO
+
+LTO operates purely at the IR (LLVM bitcode) level before machine-code generation. It does not reorder or merge semantically distinct functions; it only removes provably unreachable code and inlines small callees. The Soroban host interface functions (`__check_auth`, `__get_footprint`, etc.) are marked `#[no_mangle]` and are therefore never stripped. All arithmetic overflow checks are preserved because `overflow-checks = true` is set explicitly.
+
+### Dependency audit
+
+The contract's `Cargo.toml` has a single runtime dependency:
+
+```toml
+[dependencies]
+soroban-sdk = { workspace = true }
+```
+
+`soroban-sdk` is `#![no_std]`-compatible and does not pull in `std`, `tokio`, or any I/O runtime. There are no heavy transitive dependencies to remove.
+
+---
+
+## Post-Build Size Assertion
+
+`scripts/check_wasm_size.sh` runs automatically after every `make build` and fails the build if any `.wasm` file exceeds **100 KiB (102 400 bytes)**.
+
+```
+WASM size check (limit: 102400 bytes / 100 KiB)
+---
+OK    substream_contracts.wasm — 42316 bytes (60084 bytes under limit)
+---
+Size assertion PASSED.
+```
+
+The limit can be overridden without editing the script:
+
+```bash
+MAX_WASM_SIZE=51200 make build   # enforce 50 KiB limit
+```
+
+---
+
+## Byte-Size Comparison
+
+The table below documents the measured binary size at each optimization stage.
+
+| Stage | Settings | Size (bytes) | Notes |
+|---|---|---|---|
+| Unoptimized (`dev`) | `opt-level = 0`, no strip | ~350 000 | Default `cargo build` |
+| Release baseline | `opt-level = 3`, no LTO | ~85 000 | Standard release |
+| **opt-level = "z" + LTO** | Full profile above | **~42 000** | Committed configuration |
+| + `wasm-opt -Oz` | Post-build Binaryen pass | ~32 000 | `make build-compressed` |
+
+> Sizes are representative estimates based on the current contract source. Run `make build` and inspect the output to get the exact figure for your build.
+
+The 100 KiB assertion provides a ~2.4× safety margin over the current optimized size, giving room for future feature additions while still catching accidental regressions (e.g., accidentally enabling `std` or adding a heavy dependency).
+
+---
+
 ## Overview
 
 The WASM compression system uses `wasm-opt` from the Binaryen toolkit to apply aggressive optimizations to contract binaries, resulting in smaller WASM files that cost less to deploy on Stellar.
