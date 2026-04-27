@@ -1344,6 +1344,25 @@ impl SubStreamContract {
     /// # Errors
     /// Same as `subscribe`.
     #[allow(clippy::too_many_arguments)]
+    /// Gift a subscription: `payer` funds the stream but `beneficiary` receives access.
+    ///
+    /// Identical to [`subscribe`] except the payer and beneficiary can differ,
+    /// enabling gifted subscriptions (e.g. a parent paying for a child's account).
+    ///
+    /// # Arguments
+    /// * `payer`           – Address that transfers tokens; requires auth.
+    /// * `beneficiary`     – Address that receives the subscription benefit.
+    /// * `creator`         – Verified merchant/creator receiving the stream.
+    /// * `token`           – SAC token address used for payment.
+    /// * `amount`          – Initial deposit (in token units).
+    /// * `rate_per_second` – Nano-token charge per second after the trial ends.
+    /// * `referrer`        – Optional referrer address for the 1% rebate programme.
+    ///
+    /// # Errors
+    /// Panics with `"exists"` if a subscription already exists for this pair.
+    /// Panics with `"creator is not a verified merchant"` if the creator is unverified.
+    /// Panics with `"rate below floor"` if `rate_per_second` is below the creator's minimum.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn subscribe_gift(
         env: &Env,
         payer: Address,
@@ -1571,6 +1590,25 @@ impl SubStreamContract {
     /// Panics if `creators.len() != 5`, percentages do not sum to 100, or the
     /// protocol is soft-paused.
     #[allow(clippy::too_many_arguments)]
+    /// Subscribe to a group channel that splits streaming revenue across exactly 5 creators.
+    ///
+    /// Validates that `creators.len() == 5` and `percentages` sum to exactly 100 before
+    /// delegating to `subscribe_core`. The same 7-day free trial and loyalty discount
+    /// rules apply as for single-creator subscriptions.
+    ///
+    /// # Arguments
+    /// * `payer`           – Payer and beneficiary; requires auth.
+    /// * `channel_id`      – Unique address identifying the group channel.
+    /// * `token`           – SAC token address used for payment.
+    /// * `amount`          – Initial deposit (in token units).
+    /// * `rate_per_second` – Nano-token charge per second after the trial ends.
+    /// * `creators`        – Exactly 5 creator addresses.
+    /// * `percentages`     – Revenue split percentages (must sum to 100).
+    ///
+    /// # Errors
+    /// Panics with `"group channel must contain exactly 5 creators"` if `creators.len() != 5`.
+    /// Panics with `"percentages must sum to 100"` if the splits do not add up.
+    /// Panics with `"protocol soft paused"` when the cancel-velocity circuit breaker is active.
     pub fn subscribe_group(
         env: Env,
         payer: Address,
