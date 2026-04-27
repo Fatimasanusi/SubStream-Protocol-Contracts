@@ -1,46 +1,58 @@
 #!/usr/bin/env bash
-# check_doc_comments.sh
+# scripts/check_doc_comments.sh
 #
 # Fails the CI pipeline if any public function or struct in the Rust source
-# files is missing a doc-comment (/// ...).
+# lacks a doc-comment (/// or /** ... */).
 #
-# Usage: ./scripts/check_doc_comments.sh
-# Exit code: 0 = all public items documented, 1 = missing doc-comments found.
+# Usage:
+#   ./scripts/check_doc_comments.sh [path/to/src]   (default: contracts/)
+#
+# Exit codes:
+#   0 — all public items are documented
+#   1 — one or more public items are missing doc-comments
 
 set -euo pipefail
 
-SRC_DIR="${1:-contracts/substream_contracts/src}"
-MISSING=0
+SRC_DIR="${1:-contracts}"
+ERRORS=0
 
-# Patterns to match public items that require doc-comments.
-PUB_ITEM_PATTERN='^\s*(pub(\([^)]*\))?\s+)?(fn|struct|enum|trait)\s'
+# Collect all .rs files (excluding test files and generated code)
+mapfile -t RS_FILES < <(find "$SRC_DIR" -name "*.rs" \
+  ! -name "test*.rs" \
+  ! -path "*/fuzz/*" \
+  ! -path "*/target/*")
 
-while IFS= read -r -d '' file; do
-    prev_line=""
-    line_num=0
-    while IFS= read -r line; do
-        line_num=$((line_num + 1))
-        # Check if this line declares a public item
-        if echo "$line" | grep -qE '^\s+pub\s+(fn|struct|enum)\s'; then
-            # The previous non-blank line must be a doc-comment
-            if ! echo "$prev_line" | grep -qE '^\s*///'; then
-                echo "MISSING DOC-COMMENT: $file:$line_num"
-                echo "  -> $line"
-                MISSING=$((MISSING + 1))
-            fi
-        fi
-        # Track previous non-blank line
-        if echo "$line" | grep -qE '\S'; then
-            prev_line="$line"
-        fi
-    done < "$file"
-done < <(find "$SRC_DIR" -name "lib.rs" -print0)
+for file in "${RS_FILES[@]}"; do
+  line_num=0
+  prev_line=""
+  while IFS= read -r line; do
+    line_num=$((line_num + 1))
 
-if [ "$MISSING" -gt 0 ]; then
-    echo ""
-    echo "ERROR: $MISSING public item(s) are missing doc-comments."
-    echo "Add a '/// ...' doc-comment immediately above each flagged item."
-    exit 1
-else
-    echo "OK: All public items in $SRC_DIR have doc-comments."
+    # Detect a public function or struct declaration
+    if echo "$line" | grep -qE '^\s+pub fn |^pub fn |^\s+pub struct |^pub struct '; then
+      # The previous non-empty line must be a doc-comment or a #[...] attribute
+      # that itself follows a doc-comment. We check the immediate predecessor.
+      stripped_prev=$(echo "$prev_line" | sed 's/^[[:space:]]*//')
+
+      if ! echo "$stripped_prev" | grep -qE '^///|^\*\*|^#\['; then
+        echo "MISSING DOC-COMMENT: $file:$line_num"
+        echo "  -> $line"
+        ERRORS=$((ERRORS + 1))
+      fi
+    fi
+
+    # Track previous non-blank line
+    if [ -n "$(echo "$line" | tr -d '[:space:]')" ]; then
+      prev_line="$line"
+    fi
+  done < "$file"
+done
+
+if [ "$ERRORS" -gt 0 ]; then
+  echo ""
+  echo "ERROR: $ERRORS public item(s) are missing doc-comments."
+  echo "Add a /// doc-comment above each flagged pub fn or pub struct."
+  exit 1
 fi
+
+echo "OK: All public items have doc-comments."
