@@ -252,6 +252,8 @@ pub fn initialize_subscription(
     env.storage()
         .persistent()
         .set(&billing_key, &billing_info);
+    // Issue #184: Bump TTL for billing cycle entry to keep it alive during subscription lifecycle
+    env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     let rate = plan.billing_amount / plan.billing_cycle as i128;
 
@@ -282,6 +284,8 @@ pub fn initialize_subscription(
 
     let sub_key = crate::subscription_key(&subscriber, &merchant);
     crate::set_subscription(env, &sub_key, &sub);
+    // Issue #184: Bump TTL for subscription entry to keep it alive during subscription lifecycle
+    env.storage().persistent().extend_ttl(&sub_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     let mut total_flow: i128 = env
         .storage()
@@ -472,6 +476,12 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     }
 
     env.storage().persistent().set(&billing_key, &billing);
+    // Issue #184: Bump TTL for billing cycle entry to keep it alive during active subscription
+    env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
+
+    // Issue #184: Bump TTL for the subscription entry itself to keep it alive during recurring billing
+    let sub_key = crate::subscription_key(&subscriber, &merchant);
+    env.storage().persistent().extend_ttl(&sub_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 }
 
 pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amount: i128) {
@@ -540,6 +550,8 @@ pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amo
 
     billing.status = SubscriptionStatus::Disputed;
     env.storage().persistent().set(&billing_key, &billing);
+    // Issue #184: Bump TTL for billing cycle entry during dispute
+    env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     DisputeRaised {
         dispute_id,
@@ -652,6 +664,8 @@ fn resolve_dispute(
         }
 
         env.storage().persistent().set(&billing_key, &billing);
+        // Issue #184: Bump TTL for billing cycle entry after dispute resolution
+        env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
     }
 
     if user_wins {

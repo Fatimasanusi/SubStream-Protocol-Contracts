@@ -7,6 +7,61 @@ use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env};
 
 // --- Constants ---
+/// Frontend Error Mapping Documentation
+///
+/// This contract uses `panic!` messages as error signals.
+/// Frontend applications should map these exact strings
+/// to user-friendly messages.
+///
+/// already initialized -> Contract is already initialized.
+/// not initialized -> Contract has not been initialized.
+/// admin only -> Only admin can perform this action.
+/// creator is not a verified merchant -> Creator is not verified.
+/// exists -> Subscription already exists.
+/// protocol soft paused -> Protocol is temporarily paused.
+/// invalid tip -> Invalid tip amount.
+/// user already blacklisted -> User is already blacklisted.
+/// user not blacklisted -> User is not blacklisted.
+/// group channel must contain exactly 5 creators -> Group must have exactly 5 creators.
+/// percentages must sum to 100 -> Percentages must sum to 100.
+
+/// --- Reentrancy & External Call Security Audit (Issue #190) ---
+///
+/// This contract performs external calls via:
+/// - `TokenClient::transfer(...)`
+/// - Potential DEX/router interactions (buyback hooks)
+/// - Future yield routing integrations (via `YieldConfig`)
+///
+/// ## Risk: Cross-Contract Reentrancy
+///
+/// External contract calls may:
+/// - Re-enter this contract before state updates complete
+/// - Manipulate balances or subscription state
+///
+/// ## Mitigation Strategy
+///
+/// 1. **Checks-Effects-Interactions Pattern**
+///    - Internal state should be updated BEFORE external calls
+///
+/// 2. **Reentrancy Guard**
+///    - `ReentrancyGuard` is used to prevent nested execution
+///    - Critical functions should wrap execution with:
+///      `reentrancy_guard!(env, "function_name")`
+///
+/// 3. **Trusted Contract Assumptions**
+///    - `TokenClient` assumes compliant token contracts
+///    - External router (DEX) must be trusted or audited
+///
+/// 4. **Yield Hook Risk (Future)**
+///    - Any `YieldConfig` integration introduces untrusted execution paths
+///    - Must validate:
+///        - No state mutation after external call
+///        - Strict input/output validation
+///
+/// ## Auditor Notes
+///
+/// - No unsafe reentrancy pattern detected in current implementation
+/// - However, future yield hooks MUST enforce guard + ordering
 
 // --- Issue #136: Subscription struct bitmask flags ---
 /// Bitmask flag: set when the free-trial-to-paid conversion event has been emitted.
@@ -29,6 +84,11 @@ const REFERRAL_REBATE_BPS: i128 = 100; // 1% rebate
 const TTL_THRESHOLD: u32 = 17280; // Assuming ~1 day in ledgers for example
 const TTL_BUMP_AMOUNT: u32 = 518400; // Assuming ~30 days in ledgers for example
 
+// --- Protocol Fee Constants ---
+const PROTOCOL_FEE_MAX_BPS: u32 = 500; // Maximum 5% fee
+const PROTOCOL_FEE_TIMELOCK_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days for fee increases
+const DEFAULT_PROTOCOL_FEE_BPS: u32 = 200; // Default 2% fee
+
 // --- SLA Circuit Breaker Constants ---
 const SLA_THRESHOLD_BPS: u32 = 9990; // 99.9% uptime threshold (in basis points)
 const SEVEN_DAYS: u64 = 7 * 24 * 60 * 60;
@@ -45,7 +105,6 @@ const CANCEL_VELOCITY_MIN_TRIGGER: u32 = 25; // Ignore small protocols / cold st
 // --- Merchant Registry and KYC Whitelisting Constants ---
 pub(crate) const DAO_MULTISIG_THRESHOLD: u32 = 3; // Minimum signatures required for DAO decisions
 const MERCHANT_KYC_VALIDITY: u64 = 365 * 24 * 60 * 60; // 1 year validity for KYC credentials
-const SEP12_KYC_ISSUER: &str = "GD5DQX2K7Q4D4PE4R6J4Y7Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2Q2"; // SEP-12 KYC issuer address
 const TIMELOCK_DURATION: u64 = 48 * 60 * 60; // 48-hour timelock for registry updates
 const SECURITY_COUNCIL_SIZE: u32 = 5; // 5-member security council for multi-sig
 
@@ -144,6 +203,9 @@ pub enum DataKey {
     SecurityCouncilVeto(Address, u64),     // (council_member, proposal_id)
     // --- Merchant reference ID for webhook payloads (issue #130) ---
     MerchantReferenceId(Address, Address), // (subscriber, merchant)
+    // --- Secure Initialization Pattern (Issue #199) ---
+    ContractInitialized,                   // Flag to prevent re-initialization
+    KYCIssuer,                            // Configurable KYC issuer address
     // --- Misc persistent ---
     MinimumRate(Address),
     CommunityGoal(Address),
@@ -160,6 +222,10 @@ pub enum DataKey {
     AffiliateConfig(Address),
     AffiliateReferral(Address, Address),   // (merchant, affiliate)
     MerchantVacationMode(Address),
+    // --- Protocol Fee Governance ---
+    ProtocolFeeConfig,
+    ProtocolFeeUpdateProposal(u64),
+    SecurityCouncilVetoFee(Address, u64), // (council_member, proposal_id)
 }
 
 #[contracttype]
@@ -650,6 +716,55 @@ pub struct VacationModeStatus {
     pub pause_duration: u64,
 }
 
+// --- Issue #197: Protocol Fee Governance Data Structures ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeConfig {
+    /// Current protocol fee in basis points (e.g., 200 = 2%)
+    pub current_fee_bps: u32,
+    /// Address that last updated the fee
+    pub updated_by: Address,
+    /// Timestamp of last update
+    pub last_updated: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolFeeUpdateProposal {
+    /// Unique proposal identifier
+    pub proposal_id: u64,
+    /// New fee rate in basis points
+    pub new_fee_bps: u32,
+    /// Old fee rate in basis points
+    pub old_fee_bps: u32,
+    /// Address that proposed the change
+    pub proposed_by: Address,
+    /// Timestamp when proposal was created
+    pub proposed_at: u64,
+    /// Timestamp when proposal can be executed (timelock)
+    pub executable_at: u64,
+    /// Whether this is a fee increase (triggers timelock)
+    pub is_fee_increase: bool,
+    /// List of security council members who voted for this proposal
+    pub votes_for: soroban_sdk::Vec<Address>,
+    /// Whether the proposal has been executed
+    pub executed: bool,
+    /// Whether the proposal has been canceled
+    pub canceled: bool,
+    /// Reason for the fee change
+    pub reason: soroban_sdk::String,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityCouncilVetoFee {
+    pub council_member: Address,
+    pub proposal_id: u64,
+    pub veto_reason: soroban_sdk::String,
+    pub vetoed_at: u64,
+}
+
 // --- Issue #123: Affiliate Referral Fee Routing ---
 
 /// Affiliate configuration for a merchant's referral program.
@@ -1080,6 +1195,44 @@ pub struct SecurityCouncilVetoed {
     pub vetoed_at: u64,
 }
 
+// --- Issue #197: Protocol Fee Governance Events ---
+
+#[contractevent]
+pub struct ProtocolFeeUpdateScheduled {
+    #[topic] pub proposal_id: u64,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+    #[topic] pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+    pub is_fee_increase: bool,
+    pub reason: soroban_sdk::String,
+}
+
+#[contractevent]
+pub struct ProtocolFeeUpdateExecuted {
+    #[topic] pub proposal_id: u64,
+    pub old_fee_bps: u32,
+    pub new_fee_bps: u32,
+    #[topic] pub executed_by: Address,
+    pub executed_at: u64,
+}
+
+#[contractevent]
+pub struct ProtocolFeeUpdateCanceled {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub canceled_by: Address,
+    pub canceled_at: u64,
+}
+
+#[contractevent]
+pub struct SecurityCouncilVetoedFee {
+    #[topic] pub proposal_id: u64,
+    #[topic] pub council_member: Address,
+    pub veto_reason: soroban_sdk::String,
+    pub vetoed_at: u64,
+}
+
 // --- Global Reentrancy Guard Events ---
 
 #[contractevent]
@@ -1235,20 +1388,73 @@ pub struct SubStreamContract;
 #[allow(clippy::too_many_arguments)]
 #[contractimpl]
 impl SubStreamContract {
-    /// Initialize the contract and set the contract admin.
+    /// Initialize the contract with secure initialization pattern (Issue #199).
+    ///
+    /// This function atomically initializes the contract admin, security council members,
+    /// and KYC issuer to prevent hijacking of the master merchant registry.
     ///
     /// # Arguments
     /// * `admin` — Address that will hold admin privileges.
+    /// * `security_council` — Exactly 5 addresses for the security council (3-of-5 multi-sig).
+    /// * `kyc_issuer` — Authorized SEP-12 KYC issuer address.
     ///
     /// # Errors
-    /// Panics if the contract has already been initialized.
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().persistent().has(&DataKey::ContractAdmin) {
+    /// Panics if the contract has already been initialized, security council size is not 5,
+    /// or if any address is invalid.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        security_council: soroban_sdk::Vec<Address>,
+        kyc_issuer: Address,
+    ) {
+        // Prevent re-initialization
+        if env.storage().persistent().has(&DataKey::ContractInitialized) {
             panic!("already initialized");
         }
+
+        // Validate security council size
+        if security_council.len() != SECURITY_COUNCIL_SIZE as usize {
+            panic!("security council must have exactly 5 members");
+        }
+
+        // Validate no duplicate security council members
+        for i in 0..security_council.len() {
+            for j in (i + 1)..security_council.len() {
+                if security_council.get(i).unwrap() == security_council.get(j).unwrap() {
+                    panic!("duplicate security council member");
+                }
+            }
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Set contract admin
         env.storage()
             .persistent()
             .set(&DataKey::ContractAdmin, &admin);
+
+        // Set KYC issuer
+        env.storage()
+            .persistent()
+            .set(&DataKey::KYCIssuer, &kyc_issuer);
+
+        // Initialize security council members atomically
+        for i in 0..security_council.len() {
+            let member = security_council.get(i).unwrap();
+            let council_member = SecurityCouncilMember {
+                member: member.clone(),
+                added_at: now,
+                is_active: true,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::SecurityCouncilMember(member.clone()), &council_member);
+        }
+
+        // Set initialization flag to prevent re-initialization
+        env.storage()
+            .persistent()
+            .set(&DataKey::ContractInitialized, &true);
     }
 
     /// Grant verified-creator status to a creator address.
@@ -2190,37 +2396,305 @@ impl SubStreamContract {
         }.publish(&env);
     }
     
-    /// Initialize Security Council (5 members)
+    /// DEPRECATED: Security council initialization is now part of the main initialize function.
+    /// This function is kept for backward compatibility but will always fail.
+    /// Use the new initialize function with security council parameters instead.
+    #[deprecated(note = "Use initialize() with security council parameter")]
     pub fn initialize_security_council(env: Env, admin: Address, council_members: soroban_sdk::Vec<Address>) {
+        panic!("initialize_security_council is deprecated. Security council must be initialized atomically via initialize()");
+    }
+
+    // =========================================================================
+    // Issue #197: DAO-Governed Protocol Fee Parameter Updates
+    // =========================================================================
+
+    /// Initialize protocol fee configuration with default values.
+    /// Can only be called by the contract admin.
+    pub fn initialize_protocol_fee(env: Env, admin: Address) {
         admin.require_auth();
-        
-        // Verify admin authorization
-        let stored_admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ContractAdmin)
-            .expect("not initialized");
-        if admin != stored_admin {
-            panic!("admin only");
+        require_contract_admin(&env, &admin);
+
+        // Check if already initialized
+        if env.storage().persistent().has(&DataKey::ProtocolFeeConfig) {
+            panic!("protocol fee already initialized");
         }
-        
-        // Verify exactly 5 members
-        if council_members.len() != SECURITY_COUNCIL_SIZE as usize {
-            panic!("security council must have exactly 5 members");
-        }
-        
+
         let now = env.ledger().timestamp();
-        
-        // Add all council members
-        for i in 0..council_members.len() {
-            let member = council_members.get(i).unwrap();
-            let council_member = SecurityCouncilMember {
-                member: member.clone(),
-                added_at: now,
-                is_active: true,
-            };
-            env.storage().persistent().set(&DataKey::SecurityCouncilMember(member.clone()), &council_member);
+        let fee_config = ProtocolFeeConfig {
+            current_fee_bps: DEFAULT_PROTOCOL_FEE_BPS,
+            updated_by: admin.clone(),
+            last_updated: now,
+        };
+
+        env.storage().persistent().set(&DataKey::ProtocolFeeConfig, &fee_config);
+    }
+
+    /// Get the current protocol fee configuration.
+    pub fn get_protocol_fee_config(env: Env) -> ProtocolFeeConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProtocolFeeConfig)
+            .expect("protocol fee not initialized")
+    }
+
+    /// Propose a protocol fee update with mandatory 7-day timelock for increases.
+    /// Requires 3-of-5 multi-sig consensus from security council before execution.
+    ///
+    /// # Arguments
+    /// * `proposer` - Address proposing the fee change (must be security council member or admin)
+    /// * `new_fee_bps` - New fee rate in basis points (max 500 = 5%)
+    /// * `reason` - Rationale for the fee change
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Proposer is not authorized (not security council member or admin)
+    /// - New fee exceeds maximum (500 bps)
+    /// - New fee equals current fee (no change)
+    /// - Contract is not initialized
+    pub fn propose_protocol_fee_update(
+        env: Env,
+        proposer: Address,
+        new_fee_bps: u32,
+        reason: soroban_sdk::String,
+    ) -> u64 {
+        proposer.require_auth();
+
+        // Verify contract is initialized
+        if !is_contract_initialized(&env) {
+            panic!("contract not initialized");
         }
+
+        // Verify protocol fee is initialized
+        let current_config = env.storage().persistent()
+            .get::<ProtocolFeeConfig>(&DataKey::ProtocolFeeConfig)
+            .expect("protocol fee not initialized");
+
+        // Verify proposer is authorized (Security Council member or admin)
+        if !is_authorized_proposer(&env, &proposer) {
+            panic!("unauthorized proposer");
+        }
+
+        // Validate new fee
+        if new_fee_bps > PROTOCOL_FEE_MAX_BPS {
+            panic!("fee exceeds maximum");
+        }
+        if new_fee_bps == current_config.current_fee_bps {
+            panic!("no change in fee");
+        }
+
+        // Generate unique proposal ID
+        let proposal_id = generate_protocol_fee_proposal_id(&env);
+
+        let now = env.ledger().timestamp();
+        let is_fee_increase = new_fee_bps > current_config.current_fee_bps;
+        let executable_at = if is_fee_increase {
+            now.saturating_add(PROTOCOL_FEE_TIMELOCK_DURATION) // 7-day timelock for increases
+        } else {
+            now // Immediate execution for decreases
+        };
+
+        let proposal = ProtocolFeeUpdateProposal {
+            proposal_id,
+            new_fee_bps,
+            old_fee_bps: current_config.current_fee_bps,
+            proposed_by: proposer.clone(),
+            proposed_at: now,
+            executable_at,
+            is_fee_increase,
+            votes_for: soroban_sdk::Vec::new(&env),
+            executed: false,
+            canceled: false,
+            reason: reason.clone(),
+        };
+
+        env.storage().persistent().set(&DataKey::ProtocolFeeUpdateProposal(proposal_id), &proposal);
+
+        // Emit event
+        ProtocolFeeUpdateScheduled {
+            proposal_id,
+            old_fee_bps: current_config.current_fee_bps,
+            new_fee_bps,
+            proposed_by: proposer,
+            proposed_at: now,
+            executable_at,
+            is_fee_increase,
+            reason,
+        }.publish(&env);
+
+        proposal_id
+    }
+
+    /// Vote on a protocol fee update proposal (3-of-5 multi-sig).
+    /// Only security council members can vote.
+    ///
+    /// # Arguments
+    /// * `voter` - Address of the security council member voting
+    /// * `proposal_id` - ID of the proposal to vote on
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Voter is not a security council member
+    /// - Proposal not found or no longer active
+    /// - Already voted on this proposal
+    pub fn vote_protocol_fee_update(env: Env, voter: Address, proposal_id: u64) {
+        voter.require_auth();
+
+        // Verify voter is Security Council member
+        if !is_security_council_member(&env, &voter) {
+            panic!("not a security council member");
+        }
+
+        let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
+        let mut proposal: ProtocolFeeUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+
+        // Check if proposal is still pending
+        if proposal.executed || proposal.canceled {
+            panic!("proposal no longer active");
+        }
+
+        // Check if already voted
+        if proposal.votes_for.contains(&voter) {
+            panic!("already voted");
+        }
+
+        // Add vote
+        proposal.votes_for.push_back(voter.clone());
+
+        // Update proposal
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Check if consensus threshold is reached (3-of-5)
+        if proposal.votes_for.len() >= DAO_MULTISIG_THRESHOLD as usize {
+            // For fee increases, timelock must be respected
+            if proposal.is_fee_increase {
+                let now = env.ledger().timestamp();
+                if now < proposal.executable_at {
+                    // Consensus reached but timelock not expired - proposal is ready for execution
+                    return;
+                }
+            }
+
+            // Execute the proposal automatically
+            execute_protocol_fee_update_internal(&env, proposal_id);
+        }
+    }
+
+    /// Execute a protocol fee update proposal (after timelock expires for increases).
+    /// Can be called by anyone once consensus is reached and timelock expired.
+    ///
+    /// # Arguments
+    /// * `executor` - Address executing the proposal
+    /// * `proposal_id` - ID of the proposal to execute
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Proposal not found or no longer active
+    /// - Timelock not expired (for fee increases)
+    /// - Consensus threshold not reached
+    pub fn execute_protocol_fee_update(env: Env, executor: Address, proposal_id: u64) {
+        executor.require_auth();
+
+        let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
+        let proposal: ProtocolFeeUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+
+        // Verify proposal is ready for execution
+        if proposal.executed || proposal.canceled {
+            panic!("proposal no longer active");
+        }
+
+        // Check timelock (for fee increases)
+        if proposal.is_fee_increase {
+            let now = env.ledger().timestamp();
+            if now < proposal.executable_at {
+                panic!("timelock not expired");
+            }
+        }
+
+        // Check consensus threshold
+        if proposal.votes_for.len() < DAO_MULTISIG_THRESHOLD as usize {
+            panic!("consensus not reached");
+        }
+
+        // Execute the proposal
+        execute_protocol_fee_update_internal(&env, proposal_id);
+
+        // Emit execution event
+        ProtocolFeeUpdateExecuted {
+            proposal_id,
+            old_fee_bps: proposal.old_fee_bps,
+            new_fee_bps: proposal.new_fee_bps,
+            executed_by: executor,
+            executed_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+
+    /// Security Council veto of a pending protocol fee proposal.
+    /// Any single security council member can veto a proposal.
+    ///
+    /// # Arguments
+    /// * `council_member` - Address of the security council member vetoing
+    /// * `proposal_id` - ID of the proposal to veto
+    /// * `veto_reason` - Reason for the veto
+    ///
+    /// # Errors
+    /// Panics if:
+    /// - Caller is not a security council member
+    /// - Proposal not found or already executed/canceled
+    pub fn security_council_veto_fee(
+        env: Env,
+        council_member: Address,
+        proposal_id: u64,
+        veto_reason: soroban_sdk::String,
+    ) {
+        council_member.require_auth();
+
+        // Verify council member authority
+        if !is_security_council_member(&env, &council_member) {
+            panic!("not a security council member");
+        }
+
+        let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
+        let mut proposal: ProtocolFeeUpdateProposal = env.storage().persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+
+        // Can only veto pending proposals
+        if proposal.executed || proposal.canceled {
+            panic!("cannot veto executed or canceled proposal");
+        }
+
+        // Cancel the proposal
+        proposal.canceled = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        // Record veto
+        let veto = SecurityCouncilVetoFee {
+            council_member: council_member.clone(),
+            proposal_id,
+            veto_reason: veto_reason.clone(),
+            vetoed_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&DataKey::SecurityCouncilVetoFee(council_member.clone(), proposal_id), &veto);
+
+        // Emit veto event
+        SecurityCouncilVetoedFee {
+            proposal_id,
+            council_member: council_member.clone(),
+            veto_reason,
+            vetoed_at: env.ledger().timestamp(),
+        }.publish(&env);
+    }
+
+    /// Get a protocol fee proposal by ID.
+    pub fn get_protocol_fee_proposal(env: Env, proposal_id: u64) -> ProtocolFeeUpdateProposal {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ProtocolFeeUpdateProposal(proposal_id))
+            .expect("proposal not found")
     }
     
     // --- Merchant Registry and KYC Whitelisting Functions ---
@@ -2230,13 +2704,14 @@ impl SubStreamContract {
     /// # Arguments
     /// * `merchant` — Address of the merchant to register.
     /// * `kyc_credential_hash` — Hash of the KYC credential issued by the SEP-12 provider.
-    /// * `issuer` — Must match the authorized `SEP12_KYC_ISSUER` address.
+    /// * `issuer` — Must match the configured KYC issuer address.
     ///
     /// # Auth
     /// Requires `merchant` authorization.
     ///
     /// # Errors
-    /// Panics if the issuer is not the authorized SEP-12 KYC provider or the merchant is blacklisted.
+    /// Panics if the issuer is not the authorized KYC provider, the merchant is blacklisted,
+    /// or the contract is not properly initialized.
     pub fn register_merchant_with_kyc(
         env: Env,
         merchant: Address,
@@ -2244,33 +2719,27 @@ impl SubStreamContract {
         issuer: Address,
     ) {
         merchant.require_auth();
-        
-        // Verify issuer is authorized SEP-12 KYC provider
-        let authorized_issuer = Address::from_string(&soroban_sdk::String::from_str(&env, SEP12_KYC_ISSUER));
+
+        // Verify contract is properly initialized
+        if !is_contract_initialized(&env) {
+            panic!("contract not initialized");
+        }
+
+        // Verify issuer is authorized KYC provider (from configuration, not hardcoded)
+        let authorized_issuer: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KYCIssuer)
+            .expect("KYC issuer not configured");
         if issuer != authorized_issuer {
             panic!("unauthorized KYC issuer");
         }
 
-        let elapsed = (now - charge_start) as i128;
-        let accrued = elapsed
-            .saturating_mul(grant.rate_per_second)
-            .saturating_add(grant.accrued_remainder);
-        let payout_tokens = accrued / PRECISION_MULTIPLIER;
-        let available_tokens = grant.balance / PRECISION_MULTIPLIER;
-        let actual_payout = payout_tokens.min(available_tokens);
-
-        if actual_payout > 0 {
-            let token_client = TokenClient::new(&env, &grant.token);
-            token_client.transfer(&env.current_contract_address(), &creator, &actual_payout);
-            credit_creator_earnings(&env, &creator, actual_payout);
-            credit_fan_contribution(&env, &grant.dao, &creator, actual_payout);
-        }
-        
         // Check if merchant is blacklisted
         if is_merchant_blacklisted(&env, &merchant) {
             panic!("merchant is blacklisted");
         }
-        
+
         let now = env.ledger().timestamp();
         
         // Create KYC credential
@@ -2489,6 +2958,26 @@ impl SubStreamContract {
         env.storage().persistent()
             .get(&DataKey::MerchantRegistry(merchant))
             .expect("merchant not found")
+    }
+
+    // --- Secure Initialization Helper Functions (Issue #199) ---
+
+    /// Returns `true` if the contract has been properly initialized.
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ContractInitialized)
+    }
+
+    /// Returns the configured KYC issuer address.
+    ///
+    /// # Errors
+    /// Panics if the contract is not initialized.
+    pub fn get_kyc_issuer(env: Env) -> Address {
+        env.storage()
+            .persistent()
+            .get(&DataKey::KYCIssuer)
+            .expect("contract not initialized")
     }
 
     // --- Anonymous Subscription Verification with Nullifier Tracking ---
@@ -3775,6 +4264,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         // In Soroban the subscriber pre-funds the contract; a zero balance means
         // the allowance has effectively been revoked (funds exhausted / not topped up).
         let contract_balance = token_client.balance(&env.current_contract_address());
+        assert!(contract_balance >= 0, "contract_balance must be non-negative");
         if contract_balance <= 0 {
             return AllowanceHealth::AllowanceRevoked;
         }
@@ -3799,6 +4289,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         // We use the subscription's stored balance (in nano units) as the proxy —
         // this avoids leaking the subscriber's total wallet balance.
         let balance_tokens = sub.balance / PRECISION_MULTIPLIER;
+        assert!(balance_tokens >= 0, "balance_tokens must be non-negative");
         if balance_tokens >= upcoming_charge {
             AllowanceHealth::Healthy
         } else {
@@ -3861,7 +4352,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
             .persistent()
             .get(&DataKey::Tombstone(subscriber, creator))
     }
-}
+
 
 /// Helper function to adjust all active subscriptions for a merchant after vacation mode
 /// This extends the subscription duration by the pause duration to preserve paid-for time
@@ -4972,6 +5463,211 @@ fn get_current_plan_id(env: &Env, merchant: &Address, billing_amount: i128) -> u
         }
     }
     0 // Default plan ID if not found
+}
+
+// --- Secure Initialization Helper Functions (Issue #199) ---
+
+/// Internal helper to check if the contract has been properly initialized.
+fn is_contract_initialized(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .has(&DataKey::ContractInitialized)
+}
+
+// --- Helper Functions for Governance Access Control ---
+
+/// Check if an address is a security council member.
+fn is_security_council_member(env: &Env, address: &Address) -> bool {
+    if let Some(member) = env.storage().persistent().get::<SecurityCouncilMember>(&DataKey::SecurityCouncilMember(address.clone())) {
+        member.is_active
+    } else {
+        false
+    }
+}
+
+/// Check if an address is authorized to propose governance changes.
+/// Authorized proposers are security council members or the contract admin.
+fn is_authorized_proposer(env: &Env, address: &Address) -> bool {
+    if is_security_council_member(env, address) {
+        return true;
+    }
+    
+    // Check if address is the contract admin
+    if let Some(admin) = env.storage().persistent().get::<Address>(&DataKey::ContractAdmin) {
+        return admin == *address;
+    }
+    
+    false
+}
+
+/// Check if an address is authorized to vote on DAO proposals.
+/// For now, this is the same as being a security council member.
+fn is_authorized_voter(env: &Env, address: &Address) -> bool {
+    is_security_council_member(env, address)
+}
+
+/// Check if an address is an authorized DAO member.
+/// For now, this is the same as being a security council member.
+fn is_authorized_dao_member(env: &Env, address: &Address) -> bool {
+    is_security_council_member(env, address)
+}
+
+/// Generate a unique proposal ID for registry updates.
+fn generate_registry_proposal_id(env: &Env) -> u64 {
+    let key = DataKey::RegistryUpdateProposal(0);
+    // Use a counter stored in persistent storage
+    let counter: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    let new_id = counter + 1;
+    env.storage().persistent().set(&key, &new_id);
+    new_id
+}
+
+/// Generate a unique proposal ID for protocol fee updates.
+fn generate_protocol_fee_proposal_id(env: &Env) -> u64 {
+    let key = DataKey::ProtocolFeeUpdateProposal(0);
+    // Use a counter stored in persistent storage
+    let counter: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    let new_id = counter + 1;
+    env.storage().persistent().set(&key, &new_id);
+    new_id
+}
+
+/// Generate a unique proposal ID for DAO proposals.
+fn generate_proposal_id(env: &Env) -> u64 {
+    let key = DataKey::DAOProposal(0);
+    // Use a counter stored in persistent storage
+    let counter: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+    let new_id = counter + 1;
+    env.storage().persistent().set(&key, &new_id);
+    new_id
+}
+
+/// Execute a registry update proposal (internal function).
+fn execute_registry_update(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::RegistryUpdateProposal(proposal_id);
+    let mut proposal: RegistryUpdateProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+
+    let merchant = proposal.merchant_address.clone();
+    let update_type = proposal.update_type.clone();
+
+    match update_type {
+        RegistryUpdateType::WhitelistMerchant => {
+            let merchant_status = MerchantStatus {
+                is_verified: true,
+                is_blacklisted: false,
+                verification_method: VerificationMethod::DAOApproved,
+                registered_at: env.ledger().timestamp(),
+                last_verified: env.ledger().timestamp(),
+                dao_approved: true,
+            };
+            env.storage().persistent().set(&DataKey::MerchantRegistry(merchant.clone()), &merchant_status);
+            MerchantWhitelisted {
+                merchant: merchant.clone(),
+                verification_method: VerificationMethod::DAOApproved,
+                whitelisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::BlacklistMerchant => {
+            if let Some(mut merchant_status) = env.storage().persistent().get::<MerchantStatus>(&DataKey::MerchantRegistry(merchant.clone())) {
+                merchant_status.is_blacklisted = true;
+                merchant_status.last_verified = env.ledger().timestamp();
+                env.storage().persistent().set(&DataKey::MerchantRegistry(merchant.clone()), &merchant_status);
+            }
+            env.storage().persistent().set(&DataKey::BlacklistedMerchant(merchant.clone()), &true);
+            MerchantBlacklisted {
+                merchant: merchant.clone(),
+                blacklisted_by: env.current_contract_address(),
+                reason: soroban_sdk::String::from_str(env, "DAO security council action"),
+                blacklisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        RegistryUpdateType::RemoveMerchant => {
+            env.storage().persistent().remove(&DataKey::MerchantRegistry(merchant.clone()));
+        }
+    }
+
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
+}
+
+/// Execute a merchant DAO proposal (internal function).
+fn execute_merchant_proposal(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::DAOProposal(proposal_id);
+    let mut proposal: DAOProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+
+    let merchant = proposal.merchant_address.clone();
+    let proposal_type = proposal.proposal_type.clone();
+
+    match proposal_type {
+        ProposalType::WhitelistMerchant => {
+            let merchant_status = MerchantStatus {
+                is_verified: true,
+                is_blacklisted: false,
+                verification_method: VerificationMethod::DAOApproved,
+                registered_at: env.ledger().timestamp(),
+                last_verified: env.ledger().timestamp(),
+                dao_approved: true,
+            };
+            env.storage().persistent().set(&DataKey::MerchantRegistry(merchant.clone()), &merchant_status);
+            MerchantWhitelisted {
+                merchant: merchant.clone(),
+                verification_method: VerificationMethod::DAOApproved,
+                whitelisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+        ProposalType::BlacklistMerchant => {
+            if let Some(mut merchant_status) = env.storage().persistent().get::<MerchantStatus>(&DataKey::MerchantRegistry(merchant.clone())) {
+                merchant_status.is_blacklisted = true;
+                merchant_status.last_verified = env.ledger().timestamp();
+                env.storage().persistent().set(&DataKey::MerchantRegistry(merchant.clone()), &merchant_status);
+            }
+            env.storage().persistent().set(&DataKey::BlacklistedMerchant(merchant.clone()), &true);
+            MerchantBlacklisted {
+                merchant: merchant.clone(),
+                blacklisted_by: env.current_contract_address(),
+                reason: soroban_sdk::String::from_str(env, "DAO proposal action"),
+                blacklisted_at: env.ledger().timestamp(),
+            }.publish(env);
+        }
+    }
+
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
+
+    DAOProposalExecuted {
+        proposal_id,
+        merchant,
+        proposal_type,
+        executed: true,
+        executed_at: env.ledger().timestamp(),
+    }.publish(env);
+}
+
+/// Execute a protocol fee update proposal (internal function).
+fn execute_protocol_fee_update_internal(env: &Env, proposal_id: u64) {
+    let proposal_key = DataKey::ProtocolFeeUpdateProposal(proposal_id);
+    let mut proposal: ProtocolFeeUpdateProposal = env.storage().persistent()
+        .get(&proposal_key)
+        .expect("proposal not found");
+
+    // Update the protocol fee config
+    let mut fee_config: ProtocolFeeConfig = env.storage().persistent()
+        .get(&DataKey::ProtocolFeeConfig)
+        .expect("protocol fee not initialized");
+
+    fee_config.current_fee_bps = proposal.new_fee_bps;
+    fee_config.updated_by = env.current_contract_address();
+    fee_config.last_updated = env.ledger().timestamp();
+
+    env.storage().persistent().set(&DataKey::ProtocolFeeConfig, &fee_config);
+
+    // Mark proposal as executed
+    proposal.executed = true;
+    env.storage().persistent().set(&proposal_key, &proposal);
 }
 
 // --- Global Reentrancy Guard Helper Functions ---
