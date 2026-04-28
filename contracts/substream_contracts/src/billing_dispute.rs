@@ -2,12 +2,12 @@
 
 use crate::{
     B2BReceiptIssued, BillingCycleInfo, DataKey, DisputeRaised, DisputeRecord, DisputeResolved,
-    JurorSignature, PendingMerchantPullInfo, Plan, Subscription, SubscriptionBilled,
-    SubscriptionStatus, Subscribed, Tier, TokenClient, TrialConverted, TrialStarted,
-    PaymentFailedGracePeriodStarted, FREE_TRIAL_DURATION, GRACE_PERIOD, MINIMUM_FLOW_DURATION,
+    JurorSignature, PaymentFailedGracePeriodStarted, PendingMerchantPullInfo, Plan, Subscription,
+    SubscriptionBilled, SubscriptionStatus, Subscribed, Tier, TokenClient, TrialConverted,
+    TrialStarted, FREE_TRIAL_DURATION, GRACE_PERIOD, MINIMUM_FLOW_DURATION,
 };
 use core::borrow::Borrow;
-use soroban_sdk::{vec, Address, Bytes, BytesN, Env, Vec};
+use soroban_sdk::{vec, Address, Bytes, BytesN, Env, IntoVal, Vec};
 
 /// Issue #132: Generate a deterministic, collision-resistant receipt hash.
 /// hash = sha256(merchant_bytes || subscriber_bytes || amount_be || timestamp_be || cycle_be)
@@ -20,38 +20,32 @@ fn generate_receipt(
     cycle_number: u64,
 ) -> BytesN<32> {
     let mut buf = Bytes::new(env);
-    // Encode merchant address bytes
+
     let merchant_bytes = merchant.to_xdr(env);
     for b in merchant_bytes.iter() {
         buf.push_back(b);
     }
-    // Encode subscriber address bytes
+
     let subscriber_bytes = subscriber.to_xdr(env);
     for b in subscriber_bytes.iter() {
         buf.push_back(b);
     }
-    // Encode amount as 16-byte big-endian
+
     for b in amount.to_be_bytes() {
         buf.push_back(b);
     }
-    // Encode billed_at as 8-byte big-endian
+
     for b in billed_at.to_be_bytes() {
         buf.push_back(b);
     }
-    // Encode cycle_number as 8-byte big-endian
+
     for b in cycle_number.to_be_bytes() {
         buf.push_back(b);
     }
+
     env.crypto().sha256(&buf)
 }
 
-/// Configure the set of juror public keys used for dispute resolution.
-///
-/// # Auth
-/// Requires `admin` authorization and must match the stored contract admin.
-///
-/// # Errors
-/// Panics if `admin` is not the stored contract admin.
 pub fn configure_dispute_jurors(env: &Env, admin: &Address, juror_pubkeys: Vec<BytesN<32>>) {
     admin.require_auth();
     let stored_admin: Address = env
@@ -59,23 +53,25 @@ pub fn configure_dispute_jurors(env: &Env, admin: &Address, juror_pubkeys: Vec<B
         .persistent()
         .get(&DataKey::ContractAdmin)
         .expect("not initialized");
+
     if admin != &stored_admin {
         panic!("admin only");
     }
+
     env.storage()
         .persistent()
         .set(&DataKey::DisputeJurorKeys, &juror_pubkeys);
 }
 
-/// Compute the deterministic digest that jurors sign to cast a dispute verdict.
-///
-/// digest = sha256(dispute_id_be || user_wins_byte)
 pub fn dispute_verdict_digest(env: &Env, dispute_id: u64, user_wins: bool) -> BytesN<32> {
     let mut buf = Bytes::new(env);
+
     for b in dispute_id.to_be_bytes() {
         buf.push_back(b);
     }
+
     buf.push_back(if user_wins { 1u8 } else { 0u8 });
+
     env.crypto().sha256(&buf)
 }
 
@@ -85,9 +81,11 @@ fn next_dispute_id(env: &Env) -> u64 {
         .persistent()
         .get(&DataKey::NextDisputeId)
         .unwrap_or(1);
+
     env.storage()
         .persistent()
         .set(&DataKey::NextDisputeId, &(id.saturating_add(1)));
+
     id
 }
 
@@ -97,11 +95,13 @@ fn juror_is_registered(env: &Env, pk: &BytesN<32>) -> bool {
         .persistent()
         .get(&DataKey::DisputeJurorKeys)
         .unwrap_or_else(|| vec![env]);
+
     for j in jurors.iter() {
         if j == *pk {
             return true;
         }
     }
+
     false
 }
 
@@ -114,11 +114,14 @@ fn verify_juror_threshold(
     let digest = dispute_verdict_digest(env, dispute_id, user_wins);
     let mut valid: u32 = 0;
     let mut seen = vec![env];
+
     for i in 0..sigs.len() {
         let entry = sigs.get(i).unwrap();
+
         if !juror_is_registered(env, &entry.pubkey) {
             panic!("unknown juror");
         }
+
         let mut dup = false;
         for k in 0..seen.len() {
             if seen.get(k).unwrap() == entry.pubkey {
@@ -126,23 +129,23 @@ fn verify_juror_threshold(
                 break;
             }
         }
+
         if dup {
             panic!("duplicate juror signature");
         }
+
         seen.push_back(entry.pubkey.clone());
         env.crypto()
             .ed25519_verify(&entry.pubkey, digest.borrow(), &entry.sig);
+
         valid = valid.saturating_add(1);
     }
+
     if valid < crate::DAO_MULTISIG_THRESHOLD {
         panic!("insufficient juror signatures");
     }
 }
 
-/// Release a pending pull to the merchant if the 48-hour dispute window has elapsed
-/// and no active dispute exists.
-///
-/// This is a no-op if no pending pull exists or the window has not yet elapsed.
 pub fn maybe_release_expired_pending_pull(
     env: &Env,
     subscriber: &Address,
@@ -150,15 +153,19 @@ pub fn maybe_release_expired_pending_pull(
     contract: &Address,
 ) {
     let pending_key = DataKey::PendingMerchantPull(subscriber.clone(), merchant.clone());
+
     let Some(pending): Option<PendingMerchantPullInfo> =
         env.storage().persistent().get(&pending_key)
     else {
         return;
     };
+
     let now = env.ledger().timestamp();
+
     if now.saturating_sub(pending.pulled_at) < crate::DISPUTE_WINDOW_SEC {
         return;
     }
+
     if env
         .storage()
         .persistent()
@@ -166,23 +173,16 @@ pub fn maybe_release_expired_pending_pull(
     {
         return;
     }
+
     let token_client = TokenClient::new(env, &pending.token);
+
     if pending.amount > 0 {
         token_client.transfer(contract, merchant, &pending.amount);
     }
+
     env.storage().persistent().remove(&pending_key);
 }
 
-/// Initialize a pull-based billing subscription for a subscriber-merchant pair.
-///
-/// Creates the `BillingCycleInfo` record and the underlying `Subscription` stream.
-/// If the plan has a trial, the subscription starts in `Trial` status.
-///
-/// # Auth
-/// Requires `subscriber` authorization.
-///
-/// # Errors
-/// Panics if a subscription already exists, the plan is not found, or the trial has already been used.
 pub fn initialize_subscription(
     env: &Env,
     subscriber: Address,
@@ -191,7 +191,9 @@ pub fn initialize_subscription(
     token: Address,
 ) {
     subscriber.require_auth();
+
     let billing_key = DataKey::BillingCycle(subscriber.clone(), merchant.clone());
+
     if env.storage().persistent().has(&billing_key) {
         panic!("subscription exists");
     }
@@ -204,29 +206,35 @@ pub fn initialize_subscription(
         .expect("no plans for merchant");
 
     let mut chosen: Option<Plan> = None;
+
     for p in plans.iter() {
         if p.plan_id == plan_id && p.is_active {
             chosen = Some(p);
             break;
         }
     }
+
     let plan = chosen.expect("plan not found");
 
     if plan.has_trial {
         let trial_key = DataKey::TrialUsed(subscriber.clone(), merchant.clone());
+
         if env.storage().persistent().has(&trial_key) {
             panic!("trial already used");
         }
+
         env.storage().persistent().set(&trial_key, &true);
     }
 
     let now = env.ledger().timestamp();
     let sub_start = now.saturating_sub(MINIMUM_FLOW_DURATION + 1);
+
     let status = if plan.has_trial {
         SubscriptionStatus::Trial
     } else {
         SubscriptionStatus::Active
     };
+
     let next_billing = if plan.has_trial {
         now.saturating_add(plan.trial_duration)
     } else {
@@ -240,6 +248,7 @@ pub fn initialize_subscription(
         billing_amount: plan.billing_amount,
         billing_cycle: plan.billing_cycle,
     };
+
     env.storage()
         .persistent()
         .set(&billing_key, &billing_info);
@@ -247,6 +256,7 @@ pub fn initialize_subscription(
     env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
     let rate = plan.billing_amount / plan.billing_cycle as i128;
+
     let trial_duration = if plan.has_trial {
         plan.trial_duration
     } else {
@@ -271,6 +281,7 @@ pub fn initialize_subscription(
         beneficiary: subscriber.clone(),
         accrued_remainder: 0,
     };
+
     let sub_key = crate::subscription_key(&subscriber, &merchant);
     crate::set_subscription(env, &sub_key, &sub);
     // Issue #184: Bump TTL for subscription entry to keep it alive during subscription lifecycle
@@ -281,9 +292,10 @@ pub fn initialize_subscription(
         .persistent()
         .get(&DataKey::CurrentFlowRate(merchant.clone()))
         .unwrap_or(0);
+
     total_flow = total_flow.saturating_add(rate);
-    env
-        .storage()
+
+    env.storage()
         .persistent()
         .set(&DataKey::CurrentFlowRate(merchant.clone()), &total_flow);
 
@@ -293,8 +305,12 @@ pub fn initialize_subscription(
         let reference_id: soroban_sdk::String = env
             .storage()
             .persistent()
-            .get(&DataKey::MerchantReferenceId(subscriber.clone(), merchant.clone()))
+            .get(&DataKey::MerchantReferenceId(
+                subscriber.clone(),
+                merchant.clone(),
+            ))
             .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
+
         TrialStarted {
             subscriber: subscriber.clone(),
             merchant: merchant.clone(),
@@ -313,21 +329,12 @@ pub fn initialize_subscription(
     .publish(env);
 }
 
-/// Merchant-triggered pull: charge the subscriber for the current billing cycle.
-///
-/// Transfers `billing_amount` from the subscriber's allowance into a 48-hour
-/// dispute escrow. If the allowance is insufficient, the subscription enters
-/// `PastDue` (dunning) status and a `PaymentFailedGracePeriodStarted` event is emitted.
-///
-/// # Auth
-/// Requires `merchant` authorization.
-///
-/// # Errors
-/// Panics if the subscription is disputed, canceled, or the billing date has not yet arrived.
 pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Address) {
     merchant.require_auth();
+
     let contract = env.current_contract_address();
     let billing_key = DataKey::BillingCycle(subscriber.clone(), merchant.clone());
+
     let mut billing: BillingCycleInfo = env
         .storage()
         .persistent()
@@ -337,6 +344,7 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     if billing.status == SubscriptionStatus::Disputed {
         panic!("subscription disputed");
     }
+
     if billing.status == SubscriptionStatus::Canceled {
         panic!("subscription canceled");
     }
@@ -344,6 +352,7 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     maybe_release_expired_pending_pull(env, &subscriber, &merchant, &contract);
 
     let now = env.ledger().timestamp();
+
     if now < billing.next_billing_date {
         panic!("billing premature");
     }
@@ -354,16 +363,22 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     let amount = billing.billing_amount;
 
     let allowance = token_client.allowance(&subscriber, &contract);
+
     if allowance < amount {
         if billing.status != SubscriptionStatus::PastDue {
             billing.status = SubscriptionStatus::PastDue;
             billing.dunning_start_timestamp = now;
             env.storage().persistent().set(&billing_key, &billing);
+
             let reference_id: soroban_sdk::String = env
                 .storage()
                 .persistent()
-                .get(&DataKey::MerchantReferenceId(subscriber.clone(), merchant.clone()))
+                .get(&DataKey::MerchantReferenceId(
+                    subscriber.clone(),
+                    merchant.clone(),
+                ))
                 .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
+
             PaymentFailedGracePeriodStarted {
                 subscriber: subscriber.clone(),
                 merchant: merchant.clone(),
@@ -373,6 +388,7 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
             }
             .publish(env);
         }
+
         panic!("insufficient allowance");
     }
 
@@ -382,27 +398,44 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
         }
     }
 
-    token_client.transfer_from(&contract, &subscriber, &contract, &amount);
+    let transfer_result = env.try_invoke_contract::<(), ()>(
+        &sub.token,
+        &soroban_sdk::Symbol::new(env, "transfer_from"),
+        (contract.clone(), subscriber.clone(), contract.clone(), amount).into_val(env),
+    );
+
+    if transfer_result.is_err() {
+        if billing.status != SubscriptionStatus::PastDue {
+            billing.status = SubscriptionStatus::PastDue;
+            billing.dunning_start_timestamp = now;
+            env.storage().persistent().set(&billing_key, &billing);
+        }
+
+        panic!("pull payment failed");
+    }
 
     let pulled_at = now;
+
     let pending = PendingMerchantPullInfo {
         amount,
         token: sub.token.clone(),
         pulled_at,
     };
-    let pending_key = DataKey::PendingMerchantPull(subscriber.clone(), merchant.clone());
-    env.storage().persistent().set(&pending_key, &pending);
-    // Issue #184: Bump TTL for pending pull entry to keep it alive during dispute window
-    env.storage().persistent().extend_ttl(&pending_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 
-    // Issue #130: look up the merchant's Web2 reference ID for this subscriber.
+    env.storage().persistent().set(
+        &DataKey::PendingMerchantPull(subscriber.clone(), merchant.clone()),
+        &pending,
+    );
+
     let reference_id: soroban_sdk::String = env
         .storage()
         .persistent()
-        .get(&DataKey::MerchantReferenceId(subscriber.clone(), merchant.clone()))
+        .get(&DataKey::MerchantReferenceId(
+            subscriber.clone(),
+            merchant.clone(),
+        ))
         .unwrap_or_else(|| soroban_sdk::String::from_str(env, ""));
 
-    // Issue #132: generate deterministic receipt hash.
     let cycle_number = billing.billing_cycle;
     let receipt_hash = generate_receipt(env, &merchant, &subscriber, amount, pulled_at, cycle_number);
 
@@ -416,7 +449,6 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     }
     .publish(env);
 
-    // Issue #132: emit dedicated B2B receipt event.
     B2BReceiptIssued {
         subscriber: subscriber.clone(),
         merchant: merchant.clone(),
@@ -428,8 +460,10 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     .publish(env);
 
     billing.next_billing_date = now.saturating_add(billing.billing_cycle);
+
     if billing.status == SubscriptionStatus::Trial {
         billing.status = SubscriptionStatus::Active;
+
         TrialConverted {
             subscriber: subscriber.clone(),
             merchant: merchant.clone(),
@@ -440,6 +474,7 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
         billing.status = SubscriptionStatus::Active;
         billing.dunning_start_timestamp = 0;
     }
+
     env.storage().persistent().set(&billing_key, &billing);
     // Issue #184: Bump TTL for billing cycle entry to keep it alive during active subscription
     env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
@@ -449,38 +484,33 @@ pub fn execute_subscription_pull(env: &Env, merchant: Address, subscriber: Addre
     env.storage().persistent().extend_ttl(&sub_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
 }
 
-/// Subscriber raises a billing dispute, locking the pending pull in escrow.
-///
-/// Requires a `bond_amount` from the subscriber as a spam-prevention bond.
-/// The subscription enters `Disputed` status until the dispute is resolved.
-///
-/// # Auth
-/// Requires `subscriber` authorization.
-///
-/// # Errors
-/// Panics if no pending pull exists within the 48-hour dispute window.
 pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amount: i128) {
     subscriber.require_auth();
+
     if bond_amount <= 0 {
         panic!("bond must be positive");
     }
 
     let billing_key = DataKey::BillingCycle(subscriber.clone(), merchant.clone());
+
     let mut billing: BillingCycleInfo = env
         .storage()
         .persistent()
         .get(&billing_key)
         .expect("no billing subscription");
+
     if billing.status == SubscriptionStatus::Disputed {
         panic!("already disputed");
     }
 
     let active_key = DataKey::ActiveDispute(subscriber.clone(), merchant.clone());
+
     if env.storage().persistent().has(&active_key) {
         panic!("active dispute");
     }
 
     let pending_key = DataKey::PendingMerchantPull(subscriber.clone(), merchant.clone());
+
     let pending: PendingMerchantPullInfo = env
         .storage()
         .persistent()
@@ -488,12 +518,14 @@ pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amo
         .expect("no pull to dispute");
 
     let now = env.ledger().timestamp();
+
     if now.saturating_sub(pending.pulled_at) > crate::DISPUTE_WINDOW_SEC {
         panic!("dispute window closed");
     }
 
     let contract = env.current_contract_address();
     let token_client = TokenClient::new(env, &pending.token);
+
     token_client.transfer(&subscriber, &contract, &bond_amount);
 
     let dispute_id = next_dispute_id(env);
@@ -508,13 +540,12 @@ pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amo
         raised_at: now,
         resolved: false,
     };
-    let record_key = DataKey::DisputeRecord(dispute_id);
-    env.storage().persistent().set(&record_key, &record);
-    // Issue #184: Bump TTL for dispute record to keep it alive during dispute resolution
-    env.storage().persistent().extend_ttl(&record_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::DisputeRecord(dispute_id), &record);
+
     env.storage().persistent().set(&active_key, &dispute_id);
-    // Issue #184: Bump TTL for active dispute key to keep it alive during dispute resolution
-    env.storage().persistent().extend_ttl(&active_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
     env.storage().persistent().remove(&pending_key);
 
     billing.status = SubscriptionStatus::Disputed;
@@ -533,10 +564,6 @@ pub fn raise_dispute(env: &Env, subscriber: Address, merchant: Address, bond_amo
     .publish(env);
 }
 
-/// Resolve a dispute in the subscriber's favour (juror multi-sig required).
-///
-/// Refunds the disputed amount and bond to the subscriber.
-/// Requires `DAO_MULTISIG_THRESHOLD` valid juror signatures.
 pub fn resolve_dispute_for_user(
     env: &Env,
     subscriber: Address,
@@ -547,10 +574,6 @@ pub fn resolve_dispute_for_user(
     resolve_dispute(env, &subscriber, &merchant, dispute_id, true, juror_sigs);
 }
 
-/// Resolve a dispute in the merchant's favour (juror multi-sig required).
-///
-/// Releases the escrowed amount to the merchant and the bond to the subscriber.
-/// Requires `DAO_MULTISIG_THRESHOLD` valid juror signatures.
 pub fn resolve_dispute_for_merchant(
     env: &Env,
     subscriber: Address,
@@ -572,21 +595,25 @@ fn resolve_dispute(
     verify_juror_threshold(env, dispute_id, user_wins, juror_sigs);
 
     let active_key = DataKey::ActiveDispute(subscriber.clone(), merchant.clone());
+
     let stored_id: u64 = env
         .storage()
         .persistent()
         .get(&active_key)
         .expect("no active dispute");
+
     if stored_id != dispute_id {
         panic!("dispute id mismatch");
     }
 
     let record_key = DataKey::DisputeRecord(dispute_id);
+
     let mut record: DisputeRecord = env
         .storage()
         .persistent()
         .get(&record_key)
         .expect("dispute record missing");
+
     if record.resolved {
         panic!("already resolved");
     }
@@ -596,25 +623,22 @@ fn resolve_dispute(
     let now = env.ledger().timestamp();
 
     let (paid_user, paid_merchant, bond_to, bond_amt) = if user_wins {
-        let total_user = record
-            .disputed_amount
-            .saturating_add(record.bond_amount);
+        let total_user = record.disputed_amount.saturating_add(record.bond_amount);
+
         if total_user > 0 {
             token_client.transfer(&contract, subscriber, &total_user);
         }
-        (
-            total_user,
-            0i128,
-            subscriber.clone(),
-            record.bond_amount,
-        )
+
+        (total_user, 0i128, subscriber.clone(), record.bond_amount)
     } else {
         if record.disputed_amount > 0 {
             token_client.transfer(&contract, merchant, &record.disputed_amount);
         }
+
         if record.bond_amount > 0 {
             token_client.transfer(&contract, merchant, &record.bond_amount);
         }
+
         (
             0i128,
             record.disputed_amount,
@@ -624,10 +648,12 @@ fn resolve_dispute(
     };
 
     record.resolved = true;
+
     env.storage().persistent().set(&record_key, &record);
     env.storage().persistent().remove(&active_key);
 
     let billing_key = DataKey::BillingCycle(subscriber.clone(), merchant.clone());
+
     if let Some(mut billing) = env.storage().persistent().get::<BillingCycleInfo>(&billing_key) {
         if user_wins {
             billing.status = SubscriptionStatus::Canceled;
@@ -636,6 +662,7 @@ fn resolve_dispute(
             billing.status = SubscriptionStatus::Active;
             billing.next_billing_date = now.saturating_add(billing.billing_cycle);
         }
+
         env.storage().persistent().set(&billing_key, &billing);
         // Issue #184: Bump TTL for billing cycle entry after dispute resolution
         env.storage().persistent().extend_ttl(&billing_key, crate::TTL_THRESHOLD, crate::TTL_BUMP_AMOUNT);
@@ -643,19 +670,25 @@ fn resolve_dispute(
 
     if user_wins {
         let sub_key = crate::subscription_key(subscriber, merchant);
+
         if crate::subscription_exists(env, &sub_key) {
             let sub = crate::get_subscription(env, &sub_key);
             let rate = sub.tier.rate_per_second;
+
             let mut total_flow: i128 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::CurrentFlowRate(merchant.clone()))
                 .unwrap_or(0);
+
             total_flow = total_flow.saturating_sub(rate);
+
             env.storage()
                 .persistent()
                 .set(&DataKey::CurrentFlowRate(merchant.clone()), &total_flow);
+
             crate::unregister_creator_support(env, merchant, subscriber);
+
             env.storage().persistent().remove(&sub_key);
             env.storage().temporary().remove(&sub_key);
         }
