@@ -3820,6 +3820,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         // In Soroban the subscriber pre-funds the contract; a zero balance means
         // the allowance has effectively been revoked (funds exhausted / not topped up).
         let contract_balance = token_client.balance(&env.current_contract_address());
+        assert!(contract_balance >= 0, "contract_balance must be non-negative");
         if contract_balance <= 0 {
             return AllowanceHealth::AllowanceRevoked;
         }
@@ -3844,6 +3845,7 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
         // We use the subscription's stored balance (in nano units) as the proxy —
         // this avoids leaking the subscriber's total wallet balance.
         let balance_tokens = sub.balance / PRECISION_MULTIPLIER;
+        assert!(balance_tokens >= 0, "balance_tokens must be non-negative");
         if balance_tokens >= upcoming_charge {
             AllowanceHealth::Healthy
         } else {
