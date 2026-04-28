@@ -2499,7 +2499,9 @@ impl SubStreamContract {
     
     /// Verify a ZK-proof for an anonymous subscription and record the nullifier.
     ///
-    /// Prevents replay attacks by storing the nullifier for `NULLIFIER_VALIDITY_PERIOD` (30 days).
+    /// Prevents replay attacks by storing the nullifier in temporary storage
+    /// with a TTL matching `NULLIFIER_VALIDITY_PERIOD` (30 days). Expired
+    /// entries are automatically pruned by the ledger.
     ///
     /// # Errors
     /// Panics if the merchant is not verified or the nullifier has already been used.
@@ -2519,7 +2521,7 @@ impl SubStreamContract {
         
         // Check if nullifier already exists (replay attack prevention)
         let nullifier_key = DataKey::Nullifier(nullifier.clone());
-        if env.storage().persistent().has(&nullifier_key) {
+        if env.storage().temporary().has(&nullifier_key) {
             // Emit replay attack blocked event
             ReplayAttackBlocked {
                 merchant: merchant.clone(),
@@ -2536,23 +2538,9 @@ impl SubStreamContract {
             panic!("invalid proof length");
         }
         
-        // Store nullifier with expiration timestamp
-        let now = env.ledger().timestamp();
-        let expires_at = now.saturating_add(NULLIFIER_VALIDITY_PERIOD);
-        
-        // Store nullifier to prevent reuse
-        env.storage().persistent().set(&nullifier_key, &true);
-        
-        // Store expiration info for cleanup
-        let expiration_index_key = DataKey::NullifierExpirationIndex(now);
-        let expiration_info = NullifierExpiration {
-            nullifier: nullifier.clone(),
-            expires_at,
-        };
-        env.storage().persistent().set(&expiration_index_key, &expiration_info);
-        
-        // Set TTL for cleanup entry
-        env.storage().persistent().extend_ttl(&expiration_index_key, NULLIFIER_VALIDITY_PERIOD, NULLIFIER_VALIDITY_PERIOD);
+        // Store nullifier in temporary storage — auto-expires after TTL_BUMP_AMOUNT ledgers (~30 days)
+        env.storage().temporary().set(&nullifier_key, &true);
+        env.storage().temporary().extend_ttl(&nullifier_key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
     }
     
     /// Fallible variant of `verify_anonymous_subscription` that returns a `Result`.
@@ -2575,7 +2563,7 @@ impl SubStreamContract {
         
         // Check if nullifier already exists (replay attack prevention)
         let nullifier_key = DataKey::Nullifier(nullifier.clone());
-        if env.storage().persistent().has(&nullifier_key) {
+        if env.storage().temporary().has(&nullifier_key) {
             // Emit replay attack blocked event
             ReplayAttackBlocked {
                 merchant: merchant.clone(),
@@ -2591,64 +2579,23 @@ impl SubStreamContract {
             return Err(soroban_sdk::Error::from_contract_error(3));
         }
         
-        // Store nullifier with expiration timestamp
-        let now = env.ledger().timestamp();
-        let expires_at = now.saturating_add(NULLIFIER_VALIDITY_PERIOD);
-        
-        // Store nullifier to prevent reuse
-        env.storage().persistent().set(&nullifier_key, &true);
-        
-        // Store expiration info for cleanup
-        let expiration_index_key = DataKey::NullifierExpirationIndex(now);
-        let expiration_info = NullifierExpiration {
-            nullifier: nullifier.clone(),
-            expires_at,
-        };
-        env.storage().persistent().set(&expiration_index_key, &expiration_info);
-        
-        // Set TTL for cleanup entry
-        env.storage().persistent().extend_ttl(&expiration_index_key, NULLIFIER_VALIDITY_PERIOD, NULLIFIER_VALIDITY_PERIOD);
+        // Store nullifier in temporary storage — auto-expires after TTL_BUMP_AMOUNT ledgers (~30 days)
+        env.storage().temporary().set(&nullifier_key, &true);
+        env.storage().temporary().extend_ttl(&nullifier_key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
         
         Ok(())
     }
     
-    /// Prune expired nullifiers from storage to prevent unbounded growth.
+    /// No-op: nullifiers now use temporary storage and auto-expire.
     ///
-    /// Processes up to `NULLIFIER_CLEANUP_BATCH_SIZE` (100) entries per call.
-    /// Anyone may call this permissionlessly.
-    pub fn cleanup_expired_nullifiers(env: Env) {
-        // Create reentrancy guard
-        let _guard = reentrancy_guard!(&env, "cleanup_expired_nullifiers");
-        
-        let now = env.ledger().timestamp();
-        let mut processed = 0u64;
-        
-        // Scan for expired nullifiers by timestamp
-        let mut current_timestamp = now.saturating_sub(NULLIFIER_VALIDITY_PERIOD);
-        
-        while processed < NULLIFIER_CLEANUP_BATCH_SIZE && current_timestamp <= now {
-            let expiration_index_key = DataKey::NullifierExpirationIndex(current_timestamp);
-            
-            if let Some(expiration_info) = env.storage().persistent().get::<NullifierExpiration>(&expiration_index_key) {
-                if expiration_info.expires_at <= now {
-                    // Remove expired nullifier
-                    let nullifier_key = DataKey::Nullifier(expiration_info.nullifier.clone());
-                    env.storage().persistent().remove(&nullifier_key);
-                    
-                    // Remove expiration index entry
-                    env.storage().persistent().remove(&expiration_index_key);
-                    
-                    processed += 1;
-                }
-            }
-            
-            current_timestamp = current_timestamp.saturating_add(1);
-        }
+    /// Retained for ABI backward compatibility.
+    pub fn cleanup_expired_nullifiers(_env: Env) {
+        // Nullifiers are stored in temporary ledger entries and auto-expire.
     }
     
     /// Returns `true` if the given nullifier has already been consumed (replay protection).
     pub fn is_nullifier_used(env: Env, nullifier: soroban_sdk::Bytes) -> bool {
-        env.storage().persistent().has(&DataKey::Nullifier(nullifier))
+        env.storage().temporary().has(&DataKey::Nullifier(nullifier))
     }
 
     // =========================================================================
@@ -2716,12 +2663,13 @@ impl SubStreamContract {
     pub fn commit_buyback_nonce(env: Env, relayer: Address, nonce: u64) {
         relayer.require_auth();
         let key = DataKey::BuybackNonce(nonce);
-        if env.storage().persistent().has(&key) {
+        if env.storage().temporary().has(&key) {
             panic!("nonce already committed");
         }
         let now = env.ledger().timestamp();
-        // Store relayer address so only they can execute with this nonce
-        env.storage().persistent().set(&key, &relayer);
+        // Store relayer address in temporary storage — nonce is single-use
+        env.storage().temporary().set(&key, &relayer);
+        env.storage().temporary().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP_AMOUNT);
         BuybackNonceCommitted {
             nonce,
             committed_by: relayer,
@@ -2743,14 +2691,14 @@ impl SubStreamContract {
         let nonce_key = DataKey::BuybackNonce(nonce);
         let committed_relayer: Address = env
             .storage()
-            .persistent()
+            .temporary()
             .get(&nonce_key)
             .expect("nonce not committed");
         if committed_relayer != relayer {
             panic!("nonce belongs to different relayer");
         }
         // Burn the nonce immediately to prevent replay
-        env.storage().persistent().remove(&nonce_key);
+        env.storage().temporary().remove(&nonce_key);
 
         // --- Load and validate config ---
         let config: BuybackConfig = env
@@ -3136,12 +3084,21 @@ impl SubStreamContract {
         }
         .publish(&env);
     }
+}
 
-    // =========================================================================
-    // Issue #121: Multi-Sig Family Shared Allowances
-    // =========================================================================
+// =========================================================================
+// Subscription storage helpers
+// =========================================================================
 
-    /// Create a new family/team vault with multi-sig control
+pub(crate) fn subscription_key(subscriber: &Address, creator: &Address) -> DataKey {
+    DataKey::Subscription(subscriber.clone(), creator.clone())
+}
+
+pub(crate) fn subscription_exists(env: &Env, key: &DataKey) -> bool {
+    env.storage().persistent().has(key) || env.storage().temporary().has(key)
+}
+
+pub(crate) fn get_subscription(env: &Env, key: &DataKey) -> Subscription {
     if let Some(sub) = env.storage().persistent().get(key) {
         sub
     } else {
@@ -3167,9 +3124,19 @@ pub(crate) fn set_subscription(env: &Env, key: &DataKey, sub: &Subscription) {
     }
 }
 
+fn bump_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_BUMP_AMOUNT);
+}
+
 // =========================================================================
 // Issue #121: Multi-Sig Family Shared Allowances
 // =========================================================================
+
+#[allow(clippy::too_many_arguments)]
+#[contractimpl]
+impl SubStreamContract {
 
     /// Create a new multi-sig family/team vault for shared subscription spending.
     ///
